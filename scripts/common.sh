@@ -18,32 +18,30 @@ fi
 BASE=$(echo "$LINE" | cut -d: -f2)
 PROJECTS=$(echo "$LINE" | cut -d: -f3)
 
-# Phase 4: declarative list of external networks that compose projects
-# reference via `networks: <name>: { external: true }`. TrueNAS periodically
-# clobbers docker config (during TrueNAS app updates etc.) — we cannot rely
-# on one-time bootstrap. ensure_external_networks() is idempotent and called
-# from `up`, `dco` (for up/restart/create/run actions), and update-docker-images.
-# server's truenas-postinit also calls scripts/up, so postinit gets
-# coverage transitively.
+# Declarative list of external networks that compose projects reference
+# via `networks: <name>: { external: true }`. TrueNAS periodically
+# clobbers docker config (during TrueNAS app updates etc.) — we cannot
+# rely on one-time bootstrap. ensure_external_networks() is idempotent
+# and called from `up`, `dco` (for up/restart/create/run actions), and
+# update-docker-images. server's truenas-postinit also calls
+# scripts/up, so postinit gets coverage transitively.
 #
 # Format: <name>:<type> where type is "bridge" (default) or "internal"
-# (same as bridge but with --internal, no host egress). Phase 6 flips
-# the medium-trust networks to "internal".
+# (same as bridge but with --internal, no host egress).
 EXTERNAL_NETWORKS_SERVER=(
     # Kept as a bridge — Plex and Jellyfin both retain nas_default as
     # their bridge attachment for port-publishing NAT (Plex would need a
     # restart to swap, and Jellyfin has no zone-egress to move to).
-    # Other services dropped nas_default in 6b-1.
     "nas_default:bridge"
 
     # Ingress
     "edge_ingress:bridge"
-    "edge_internal:internal"           # flipped in Phase 6b (2026-05-15)
+    "edge_internal:internal"
 
     # Inter-service control planes
-    "arr_control:internal"             # flipped in Phase 6c (2026-05-15)
-    "serve_plex_api:internal"          # flipped in Phase 6c (2026-05-15)
-    "mon_internal:internal"            # flipped in Phase 6a (2026-05-11)
+    "arr_control:internal"
+    "serve_plex_api:internal"
+    "mon_internal:internal"
 
     # Egress (regular bridges)
     "arr_egress:bridge"
@@ -58,7 +56,7 @@ EXTERNAL_NETWORKS_SERVER=(
     "process_subarr_internal:internal"
     "personal_immich_db:internal"
     "personal_nextcloud_db:internal"
-    "serve_books_grimmory_db:internal"
+    "serve_books_bookorbit_db:internal"
     "serve_games_db:internal"
 )
 
@@ -147,10 +145,16 @@ decrypt_secrets() {
     local rc=0
     for f in "$sops_dir"/*.sops.yaml; do
         [ -f "$f" ] || continue
-        # Skip yaml-structured files — they're handled by decrypt_yaml_to
-        # (output-type yaml, written to a service-specific path).
+        # Skip whole-file secrets — they're handled by decrypt_yaml_to
+        # (yaml-structured, output-type yaml) or decrypt_file_to (binary store),
+        # each written to a service-specific path. Dotenv-flattening them would
+        # corrupt the file.
         case "$(basename "$f")" in
             traefik-middlewares.sops.yaml) continue ;;
+            kometa-config.sops.yaml)       continue ;;
+            crowdsec-bouncer.sops.yaml)    continue ;;
+            rclone-monitor.sops.yaml)      continue ;;
+            rclone-zabbix.sops.yaml)       continue ;;
         esac
         local base
         base="$(basename "$f" .sops.yaml)"
@@ -258,6 +262,55 @@ decrypt_yaml_to() {
         ghcr.io/getsops/sops:v3.13.1 \
         -d --output-type yaml "/secrets/$source_name" > "$dest_path.tmp"; then
         echo "decrypt_yaml_to: failed to decrypt $source_name" >&2
+        rm -f "$dest_path.tmp"
+        umask "$prev_umask"
+        return 1
+    fi
+    mv "$dest_path.tmp" "$dest_path"
+    chmod 600 "$dest_path"
+    umask "$prev_umask"
+}
+
+# Decrypt a SOPS-encrypted arbitrary file (binary store) to a destination path
+# with mode 0600. For non-YAML/non-dotenv config files (e.g. rclone INI) that
+# must be reproduced byte-for-byte. Source is encrypted with binary input and a
+# yaml-serialized envelope so it matches the .sops.yaml creation rule:
+#   sops -e --input-type binary --output-type yaml <file> > <name>.sops.yaml
+#
+# Usage:
+#   decrypt_file_to rclone-monitor.sops.yaml \
+#       "$BASE/common/secrets/.runtime/rclone-monitor.conf"
+decrypt_file_to() {
+    local source_name="$1"     # filename in common/secrets/
+    local dest_path="$2"       # absolute path for decrypted output
+    local sops_dir="$BASE/common/secrets"
+    [ -f "$sops_dir/$source_name" ] || return 0
+    local age_dir="$HOME/.config/sops/age"
+    if [ ! -f "$age_dir/keys.txt" ]; then
+        echo "decrypt_file_to: missing $age_dir/keys.txt" >&2
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$dest_path")"
+
+    # Skip if the destination is newer than the source — same caching
+    # rationale as decrypt_secrets.
+    if [ -f "$dest_path" ] && [ "$dest_path" -nt "$sops_dir/$source_name" ]; then
+        return 0
+    fi
+
+    local prev_umask
+    prev_umask=$(umask)
+    umask 077
+
+    if ! docker run --rm \
+        --entrypoint sops \
+        -v "$sops_dir:/secrets:ro" \
+        -v "$age_dir:/age:ro" \
+        -e SOPS_AGE_KEY_FILE=/age/keys.txt \
+        ghcr.io/getsops/sops:v3.13.1 \
+        -d --input-type yaml --output-type binary "/secrets/$source_name" > "$dest_path.tmp"; then
+        echo "decrypt_file_to: failed to decrypt $source_name" >&2
         rm -f "$dest_path.tmp"
         umask "$prev_umask"
         return 1

@@ -1,11 +1,5 @@
 # host: server
 # project: process — post-processing, analytics, *arr-tooling
-#
-# Phase 4 trust zone. Services migrated from:
-#   - media/  — tdarr, whisper, unpackerr, kometa, recyclarr,
-#               fetcharr, tautulli, kometa-ai (commented)
-#   - rpt/    — tracearr + tracearr-db (timescale) + tracearr-redis
-#   - sys/    — checkrr
 
 x-defaults: &defaults
   restart: unless-stopped
@@ -133,9 +127,10 @@ services:
       # resolves Bazarr's wanted-list paths and writes sidecars there (999).
       # Background: subarr 2.2.0's entrypoint ran `chown -R $PUID /data` with a
       # top-level-only guard; with the whole /mnt/data mounted it recursively
-      # re-owned the dataset, breaking Nextcloud + user files. Fixed upstream in
-      # 2.2.1 (coaxk/subarr#369 / PR #370 — chowns only the DB dir, never /data).
-      # Narrowing here means even a regression can't reach anything but media.
+      # re-owned the dataset to 999, breaking Nextcloud + user's files. Fixed
+      # upstream in 2.2.1 (coaxk/subarr#369 / PR #370 — chowns only the DB dir,
+      # never /data). Narrowing here means even a regression can't reach
+      # anything but media (already 999-owned, so harmless).
       - /mnt/data/media:/data/media
       - /mnt/data2/media:/data2/media
     ports:
@@ -192,7 +187,7 @@ services:
 
   unpackerr:
     <<: *hardened
-    image: golift/unpackerr:0.15.2
+    image: golift/unpackerr:v0.16.1
     container_name: unpackerr
     user: 999:999
     env_file:
@@ -201,16 +196,27 @@ services:
       - TZ=Some/Region
       - UN_LOG_FILE=/logs/unpackerr.log
       - UN_LOG_QUEUES=20m
+      # Unpackerr >=0.16 caps uncompressed bytes per top-level archive
+      # (defaults: Sonarr 20GB, Radarr 75GB, Lidarr 4GB). A capped item goes
+      # EXTRACTFAILED with no retry and nothing else in the stack can unrar
+      # a torrent, so the 4K/remux instances would strand releases. 0 = no
+      # cap. The fixed 5:1 ratio / 1000-file / 8-nested guards still apply,
+      # so a disk-fill bomb is bounded at 5x the download size.
       - UN_SONARR_0_URL=http://sonarr:8989
       - UN_SONARR_0_PROTOCOLS=torrent,usenet
+      - UN_SONARR_0_MAX_BYTES=0
       - UN_SONARR_1_URL=http://sonarr4k:9090
       - UN_SONARR_1_PROTOCOLS=torrent,usenet
+      - UN_SONARR_1_MAX_BYTES=0
       - UN_RADARR_0_URL=http://radarr:7878
       - UN_RADARR_0_PROTOCOLS=torrent,usenet
+      - UN_RADARR_0_MAX_BYTES=0
       - UN_RADARR_1_URL=http://radarr4k:7979
       - UN_RADARR_1_PROTOCOLS=torrent,usenet
+      - UN_RADARR_1_MAX_BYTES=0
       - UN_LIDARR_0_URL=http://lidarr:8686
       - UN_LIDARR_0_PROTOCOLS=torrent,usenet
+      - UN_LIDARR_0_MAX_BYTES=0
     volumes:
       - /mnt/download:/download
       - /mnt/app/db/unpackerr/logs:/logs
@@ -221,14 +227,13 @@ services:
     <<: *hardened
     # cap_drop ALL strips root's DAC bypass; kometa rotates logs in
     # /config/logs which is owned by plex:plex 0755 on the host, so root
-    # without DAC_OVERRIDE cannot create/rename files there. Silently
-    # failed every daily run from 2026-05-15 (Phase 6c recreate) through
-    # 2026-05-18 with `PermissionError: '/config/logs/meta-9.log'`.
-    # Same class of bug as the rclone DAC_READ_SEARCH fix, but kometa
-    # writes (rotation) so it needs DAC_OVERRIDE not the read-only variant.
+    # without DAC_OVERRIDE cannot create/rename files there (fails with
+    # `PermissionError: '/config/logs/meta-N.log'` on log rotation).
+    # Same class as the rclone DAC_READ_SEARCH fix, but kometa writes
+    # (rotation) so it needs DAC_OVERRIDE not the read-only variant.
     cap_add:
       - DAC_OVERRIDE
-    image: kometateam/kometa:v2.4.4
+    image: kometateam/kometa:v2.4.8
     container_name: kometa
     environment:
       - KOMETA_CONFIG=/config/config.yml
@@ -236,9 +241,12 @@ services:
     volumes:
       - /mnt/app/db/kometa:/config
       # config.yml holds secrets — SOPS-managed, decrypted to .runtime and
-      # mounted read-only over the /config dir mount. Root reads it via the
-      # DAC_OVERRIDE cap already granted above (for log rotation).
-      - ../common/secrets/.runtime/kometa-config.yml:/config/config.yml:ro
+      # mounted over the /config dir mount. Writable (NOT :ro): Kometa
+      # persists default settings (e.g. auto_sort_hubs) back into config.yml
+      # during parse and hard-crashes on a read-only file. The .runtime copy
+      # is ephemeral (regenerated from SOPS on every deploy), so this write is
+      # non-destructive and never touches the encrypted source.
+      - ../common/secrets/.runtime/kometa-config.yml:/config/config.yml
       - ./kometa/r:/r
       - ./kometa/rc:/rc
       - ./kometa/rc:/rf
@@ -247,6 +255,58 @@ services:
       - arr_control
       - serve_plex_api
       - arr_egress
+
+  kometa-ai:
+    <<: *hardened
+    # Entrypoint chowns state dirs and gosu-drops to PUID; with
+    # CLAUDE_BACKEND=cli it also downloads the Claude Code CLI on first start
+    cap_add: *lsio_caps
+    image: user/kometa-ai:0.5.9
+    container_name: kometa-ai
+    # Run once at startup (then hold the daily schedule) so a fresh deploy
+    # verifies itself instead of waiting for 03:00
+    command: ["--run-now"]
+    env_file:
+      # RADARR_API_KEY + CLAUDE_CODE_OAUTH_TOKEN (Claude subscription token)
+      - ../common/secrets/.runtime/kometa-ai.env
+    environment:
+      - RADARR_URL=http://radarr:7878
+      - CLAUDE_BACKEND=cli
+      - KOMETA_FIX_TAGS=false
+      # Soft cap on movies sent to Claude per run across all collections;
+      # paces backfill of new/changed collections so a large library can't
+      # exhaust the subscription window in one run (near-threshold re-evals
+      # and --force-refresh bypass it). 499 Existential members re-judged on
+      # the tightening deploy fit comfortably under this.
+      - MAX_EVALS_PER_RUN=2000  # backfill drained; steady-state cap (new-film + bounded near-threshold work only). Raise again only for a big re-eval.
+      - SMTP_SERVER=server.mylocal
+      - NOTIFICATION_RECIPIENTS=user@yourdomain.com
+      - NOTIFICATION_FROM=postfix@yourdomain.com
+      # Early-morning low-contention window: AFTER the 03:00 snapshot-backup
+      # container-stop and the 05:00 image updates, and before kometa's 10:00
+      # build — and past the late-night hours when the subscription 5h window is
+      # often in interactive use. (Deep-night 00:00-02:00 collides with late
+      # work sessions; 03:00-05:00 is blocked by backup + updates.)
+      - SCHEDULE_INTERVAL=1d
+      - SCHEDULE_START_TIME=06:00
+      - TZ=Some/Region
+      - PUID=999
+      - PGID=999
+    volumes:
+      - /mnt/app/db/kometa:/app/kometa-config:ro
+      - /mnt/app/db/kometa-ai/state:/app/state
+      - /mnt/app/db/kometa-ai/logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-m", "kometa_ai", "--health-check"]
+      interval: 5m
+      timeout: 30s
+      retries: 3
+      # First start downloads the Claude CLI
+      start_period: 5m
+    networks:
+      - arr_control   # radarr
+      - arr_egress    # claude.ai / api.anthropic.com
+      - nas_default   # server.mylocal smtp (postfix host port 25)
 
   recyclarr:
     <<: *hardened
@@ -263,9 +323,13 @@ services:
 
   fetcharr:
     <<: *hardened
-    image: egg82/fetcharr:2.2.0
+    image: egg82/fetcharr:2.2.1
     container_name: fetcharr
     user: 999:999
+    # JVM app: image ships MaxRAMPercentage=75 + UseContainerSupport. Without a
+    # cgroup limit the JVM sizes its heap off the host's 125GiB (~94GiB max) and
+    # G1GC drifts RSS up to multiple GiB. Cap it so the heap stays ~384MB.
+    mem_limit: 512m
     env_file:
       - ../common/secrets/.runtime/media.env
     environment:
@@ -294,7 +358,7 @@ services:
       - SETUID
       - SETGID
       - DAC_OVERRIDE
-    image: tautulli/tautulli:v2.17.2
+    image: tautulli/tautulli:v2.18.1
     container_name: tautulli
     environment:
       - PUID=999
@@ -433,7 +497,6 @@ services:
     networks:
       - serve_plex_api
       - arr_egress  # plex.tv outbound, for resolving friend server access tokens
-
 
 networks:
   nas_default:

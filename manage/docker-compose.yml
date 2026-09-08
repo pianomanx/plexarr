@@ -1,9 +1,5 @@
 # host: server
 # project: manage — *arr managers + Aurral
-#
-# Phase 4 trust zone. Services migrated from:
-#   - media/  — sonarr, sonarr4k, radarr, radarr4k, bazarr, bazarr4k
-#   - music/  — lidarr, aurral
 
 x-defaults: &defaults
   restart: unless-stopped
@@ -151,12 +147,13 @@ services:
   bazarr:
     <<: *hardened
     cap_add: *lsio_caps
-    image: lscr.io/linuxserver/bazarr:1.5.6
+    image: lscr.io/linuxserver/bazarr:1.6.0
     container_name: bazarr
     environment:
       - PUID=999
       - PGID=999
       - TZ=Some/Region
+      - LANG=C.UTF-8
     volumes:
       - /mnt/app/db/bazarr/config:/config
       - /mnt/app/db/bazarr/subcleaner:/subcleaner
@@ -167,7 +164,7 @@ services:
     healthcheck:
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:6767/api/system/ping"]
       interval: 30s
-      timeout: 10s
+      timeout: 30s
       start_period: 60s
       retries: 3
     labels:
@@ -186,6 +183,7 @@ services:
       - PUID=999
       - PGID=999
       - TZ=Some/Region
+      - LANG=C.UTF-8
     volumes:
       - /mnt/app/db/bazarr4k/config:/config
       - /mnt/app/db/bazarr4k/subcleaner:/subcleaner
@@ -214,7 +212,7 @@ services:
     # plugins (Soulseek stays via Soularr+slskd) — replaced RandomNinjaAtk
     # arr-scripts, which was removed (it ran curl|bash on every boot from a
     # now-unmaintained repo).
-    image: lscr.io/linuxserver/lidarr:nightly@sha256:706aade16e8b35f3a981e0f32229b062e28d39af20b9c6e8bd19cc9a9d911753
+    image: lscr.io/linuxserver/lidarr:nightly@sha256:78888f208e531be21e2d10c02625e0271c08dd07e03a250825d9ee9e792b07a7
     container_name: lidarr
     environment:
       - PUID=999
@@ -245,43 +243,21 @@ services:
     cap_add: *lsio_caps
     image: ghcr.io/lklynet/aurral:1.76.50
     container_name: aurral
+    # Internal-only since 2026-09-02. Previously published at
+    # music.yourdomain.com behind Traefik + oauth2-proxy (Plex login); now
+    # reached only via the host port with Aurral's own password login.
     environment:
       - PUID=999
       - PGID=999
       - DOWNLOAD_FOLDER=/app/downloads
-      - AUTH_PROXY_ENABLED=true
-      - AUTH_PROXY_HEADER=X-Auth-Request-User
-      - AUTH_PROXY_TRUSTED_IPS=
-      - AUTH_PROXY_ADMIN_USERS=user@yourdomain.com
-      - TRUST_PROXY=true
     ports:
       - "3005:3001"
     volumes:
       - /mnt/download/aurral:/app/downloads
       - /mnt/app/db/aurral:/app/backend/data
-    labels:
-      - "traefik.enable=true"
-      - "traefik.docker.network=edge_internal"
-      - "traefik.http.routers.aurral.rule=Host(`music.yourdomain.com`)"
-      - "traefik.http.routers.aurral.entrypoints=websecure"
-      - "traefik.http.routers.aurral.tls.certresolver=myresolver"
-      - "traefik.http.routers.aurral.middlewares=crowdsec@file,oauth2-proxy@docker,aurral-secure-headers@docker"
-      - "traefik.http.services.aurral.loadbalancer.server.port=3001"
-      - "traefik.http.middlewares.aurral-secure-headers.headers.stsSeconds=31536000"
-      - "traefik.http.middlewares.aurral-secure-headers.headers.stsIncludeSubdomains=true"
-      - "traefik.http.middlewares.aurral-secure-headers.headers.stsPreload=true"
-      - "traefik.http.middlewares.aurral-secure-headers.headers.frameDeny=true"
-      - "traefik.http.middlewares.aurral-secure-headers.headers.contentTypeNosniff=true"
-      - "traefik.http.middlewares.aurral-secure-headers.headers.browserXssFilter=true"
-      - "traefik.http.middlewares.aurral-secure-headers.headers.referrerPolicy=strict-origin-when-cross-origin"
-      - "traefik.http.middlewares.aurral-secure-headers.headers.permissionsPolicy=camera=(), microphone=(), geolocation=(), payment=()"
-      - "traefik.http.middlewares.aurral-secure-headers.headers.customResponseHeaders.X-Powered-By="
-      - "traefik.http.middlewares.aurral-secure-headers.headers.customResponseHeaders.Server="
     networks:
-      - edge_internal
       - arr_control
       - arr_egress
-
 
 networks:
   nas_default:

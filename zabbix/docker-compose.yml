@@ -1,9 +1,8 @@
 # host: cloud-server
 # project: zabbix — Zabbix server stack — server + web + MySQL + agent + rclone + postfix
 
-# F5 (2026-05-18): cap_drop baseline. Services do `<<: *hardened` + inline
-# `cap_add: [...]` for caps they need back. Mirrors server's monitor/
-# pattern (see Phase 5 history in plan ledger).
+# cap_drop baseline. Services do `<<: *hardened` + inline `cap_add: [...]`
+# for caps they need back. Mirrors server's monitor/ pattern.
 x-defaults: &defaults
   restart: unless-stopped
   security_opt:
@@ -149,17 +148,29 @@ services:
       - SETUID
       - SETGID
     container_name: mysql-server
-    image: mysql:8.0.46@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b
+    # Floating 8.4 LTS series tag, matching monitor-mysql (the Zabbix proxy DB
+    # on server) — 2026-08-15, previously 8.4.x pinned to a digest. The tag
+    # itself is a harder series guarantee than renovate's `allowedVersions:
+    # <8.5`: `8.4` cannot resolve to 9.x/26.x innovation releases, so the LTS
+    # line is enforced by Docker Hub, not by config. 8.4.x patches now arrive
+    # on the weekly Monday 05:00 UTC pull with no PR — deliberate, and behind
+    # Sunday 02:00's zabbix-backup.sh dump. Trade-off: git no longer records
+    # which patch is running, so read it from the host with
+    # `docker inspect --format '{{.Image}}' mysql-server`. Moving off 8.4 is a
+    # migration, not a bump: MySQL upgrades the
+    # datadir on first start and does not support downgrading it.
+    image: mysql:8.4
     # F1 (2026-05-18): no published ports — zabbix-server and zabbix-web
     # reach this via the default compose network as `mysql-server:3306`.
     # External diagnostic access goes via `docker exec mysql-server mysql ...`.
     command:
+      # 8.4 removed --skip-character-set-client-handshake,
+      # --default-authentication-plugin and --log_bin_trust_function_creators
+      # (accounts migrated to caching_sha2_password 2026-07-20; the trust flag
+      # was moot with --skip-log-bin anyway).
       - mysqld
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_bin
-      - --skip-character-set-client-handshake
-      - --default-authentication-plugin=mysql_native_password
-      - --log_bin_trust_function_creators=1
       - --skip-log-bin
       - --innodb-redo-log-capacity=536870912
     volumes:
@@ -213,9 +224,13 @@ services:
     container_name: zabbix-agent
     image: zabbix/zabbix-agent2:ubuntu-7.4.10@sha256:eaafff9f7aa805a2cb415ac5e4b43a7be8faaaed688474dc5f73faa4e2bc2942
     network_mode: host
+    # IPMI_PASSWORD for server-ipmi-reboot.sh (run in-container via Zabbix
+    # system.run). SOPS-managed; materialized to .runtime by decrypt_secrets.
+    env_file:
+      - ../common/secrets/.runtime/zabbix-agent.env
     environment:
       - ZBX_HOSTNAME=cloud-server
-      - ZBX_PASSIVESERVERS=127.0.0.1
+      - ZBX_PASSIVESERVERS=127.0.0.1,172.18.0.0/16
       - ZBX_ACTIVESERVERS=127.0.0.1
       - ZBX_DEBUGLEVEL=2
     dns:
@@ -243,36 +258,37 @@ services:
     # see feedback_hardened_anchor_strips_root_dac).
     cap_add:
       - DAC_READ_SEARCH
-    image: rclone/rclone:1.74.3@sha256:623378ad0ff3ebd5cebf77720843c0e02edfe46e2d5b5ac6bed54c6371780dfb
+    image: rclone/rclone:1.75.0@sha256:b06aed988cf5967de7c25be5925240983981c757f4ed1ac9d2fa659d51d60548
     container_name: rclone
-    # F1 (2026-05-18): bind to loopback only — webui is administered from
-    # server host via ssh tunnel. Hetzner FW already restricts ingress
-    # to the home IP, but the default `rcd/rcd` creds in the command line
-    # below mean a 0.0.0.0 binding inside the home network is still a
-    # weak link. Credential rotation deferred (now moot since unreachable).
-    ports:
-      - 127.0.0.1:5572:5572/tcp
+    environment:
+      # Use the SOPS-decrypted config (mounted below), honored by docker-exec
+      # rclone calls in zabbix-backup.sh, not the plaintext /config/rclone/rclone.conf.
+      - RCLONE_CONFIG=/config/rclone.conf
+    # 2026-05-18: rcd webui dropped. zabbix-backup.sh uses `docker exec rclone
+    # rclone copy/lsf/delete` direct CLI — the rcd HTTP API was zombie. No
+    # ports published, no creds, no API surface. Container stays alive via
+    # `sleep infinity` so docker exec keeps working.
     volumes:
+      - ../common/secrets/.runtime/rclone-zabbix.conf:/config/rclone.conf:ro
       - /data/opt/rclone:/config/rclone
       - /data/opt/rclone:/logs
       - /etc/passwd:/etc/passwd:ro
       - /etc/group:/etc/group:ro
-      - /dev/fuse:/dev/fuse
       - /data:/data
-#     - /home/user/compose/zabbix/rclone/rclone-daily.sh:/etc/periodic/daily/rclone-daily.sh
-      - /home/user/compose/zabbix/rclone/rclone-daily.sh:/rclone-daily.sh
-    # SYS_ADMIN + SETPCAP were carried from the original config but the rcd
-    # web/sync workflow does not mount fuse, so they are not needed.
-    command: rcd -v --rc-web-gui --rc-web-gui-no-open-browser --rc-addr :5572 --rc-user rclone --rc-pass rclone --transfers=3 --copy-links
+    # `rclone-daily.sh` bind mount removed (used `rclone rc sync/sync` against
+    # the rcd API which no longer runs; zabbix-backup.sh is the live workflow).
+    # /dev/fuse mount removed — rclone CLI sync to B2 doesn't mount fuse.
+    entrypoint: []
+    command: ["sleep", "infinity"]
     healthcheck:
-      # busybox nc -z probes that the rcd listener is up. HTTP basic auth
-      # means a curl-based check would also need creds; TCP-level liveness
-      # is enough.
-      test: ["CMD", "nc", "-z", "127.0.0.1", "5572"]
-      interval: 30s
+      # No HTTP listener now. Probe that the rclone binary still resolves
+      # (sleep-infinity processes don't crash, so this is mostly a presence
+      # check for autoheal — same shape as before).
+      test: ["CMD", "rclone", "version"]
+      interval: 1m
       timeout: 5s
       retries: 3
-      start_period: 30s
+      start_period: 10s
     labels:
       autoheal: "true"
 
@@ -290,7 +306,7 @@ services:
       - NET_BIND_SERVICE
     container_name: postfix
     image: boky/postfix:5.1.0
-    # F1 (2026-05-18): bind to loopback only — only server host's own
+    # F1 (2026-05-18): bind to loopback only — only cloud-server host's own
     # mailer scripts relay through this (the cron-driven agentscripts).
     # No external SMTP-in expected.
     ports:
@@ -313,9 +329,8 @@ services:
 
   # Autoheal sidecar: polls Docker for any container with label autoheal=true
   # whose .State.Health is "unhealthy" and issues `docker restart`. Mirrors
-  # server's monitor/autoheal pattern (Phase 3a, commit history). Opt-in via
-  # label so safety-critical services (zabbix-agent — privileged, host network)
-  # can stay out.
+  # server's monitor/autoheal pattern. Opt-in via label so safety-critical
+  # services (zabbix-agent — privileged, host network) can stay out.
   #
   # Note: this sidecar can't auto-restart itself if it goes unhealthy. The
   # `restart: unless-stopped` covers the trivial crash case.

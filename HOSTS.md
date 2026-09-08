@@ -12,14 +12,14 @@ Canonical: `scripts/projects.conf`. This file is a human-readable mirror.
 Each compose file at the top has a two-line header (`# host:` / `# project:`) that names its host and a one-line purpose statement. Use that as the source of truth when in doubt. This table is for navigation only.
 
 ### `server` (main, post Phase 4)
-- `edge/` — Public ingress (Traefik :443) + auth/security perimeter: oauth2-proxy, plex-oidc-bridge, CrowdSec + bouncer. Highest blast radius for misconfig but stateless.
-- `monitor/` — Observability + ops: Zabbix proxy + monitor-mysql + agent2, uptime-kuma, postfix relay, rclone, autoheal sidecar, dozzle, scrutiny, beszel + beszel-agent, prowlarr-indexer-report, organizr + homepage + per-consumer read-only socket-proxies.
+- `edge/` — Public ingress (Traefik :443) + auth/security perimeter: plex-oidc-bridge (Plex-account OIDC for the non-Plex apps), CrowdSec + bouncer, Wizarr. Highest blast radius for misconfig but stateless.
+- `monitor/` — Observability + ops: Zabbix proxy + monitor-mysql + agent2, uptime-kuma, postfix relay, rclone, autoheal sidecar, dozzle, scrutiny, beszel + beszel-agent, prowlarr-indexer-report, activity-monitor (who is reading/playing right now — the pre-change gate for non-Plex apps), organizr + homepage + per-consumer read-only socket-proxies.
 - `acquire/` — VPN-fronted downloaders + indexers (highest risk class — fetches attacker-controlled content). gluetun (single WireGuard egress) + qBittorrent + qui + Prowlarr + autobrr + FlareSolverr + slskd + soularr + SABnzbd + TheLounge.
-- `manage/` — *arr managers: Sonarr ×2 (1080/4k), Radarr ×2 (1080/4k), Lidarr, Bazarr ×2, Aurral.
+- `manage/` — *arr managers: Sonarr ×2 (1080/4k), Radarr ×2 (1080/4k), Lidarr, Bazarr ×2, Aurral (LAN-only).
 - `serve-plex/` — Plex + Seerr + Requestrr.
-- `serve-books/` — Audiobookshelf, abs-tract, ReadMeABook, plex-scan-watcher, Shelfmark, Grimmory + MariaDB.
-- `serve-games/` — RomM + MariaDB.
-- `process/` — Post-processing + analytics: Tdarr, subgen + subarr (subtitle transcription/coordination), Unpackerr, Kometa, Recyclarr, Fetcharr, Tautulli, Checkrr, Tracearr + TimescaleDB + Redis, plex-watch-sync.
+- `serve-books/` — Audiobookshelf, abs-tract, ReadMeABook, plex-scan-watcher, Shelfmark, BookOrbit + Postgres (+ bookorbit-discord-notify).
+- `serve-games/` — RomM + MariaDB (+ romm-discord-notify). Public via Traefik with Plex login through plex-oidc-bridge.
+- `process/` — Post-processing + analytics: Tdarr, subgen + subarr (subtitle transcription/coordination), Unpackerr, Kometa + kometa-ai (Claude-judged collections), Recyclarr, Fetcharr, Tautulli, Checkrr, Tracearr + TimescaleDB + Redis, plex-watch-sync.
 - `personal/` — High-data-sensitivity stacks: Immich (server, ML, postgres, redis, power-tools), Nextcloud + Postgres + Redis + clamav + elasticsearch. Per-app DB networks `internal: true`.
 
 Pre-Phase-4 layout (12 themed projects: `nas` `sys` `monproxy` `media` `music` `abook` `ebook` `photo` `rpt` `files` `games`) is preserved in this repo's git history if you want to compare the older shape — see `git log` before the trust-zone restructure commit on `main`.

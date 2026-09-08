@@ -1,7 +1,5 @@
 # host: server
 # project: serve-games — retro gaming server (RomM + MariaDB)
-#
-# Phase 4 trust zone. Migrated from games/.
 
 x-defaults: &defaults
   restart: unless-stopped
@@ -39,13 +37,15 @@ services:
     # mariadb entrypoint runs as root, chowns /var/lib/mysql, drops to
     # mysql user via gosu.
     cap_add: *lsio_caps
-    image: mariadb:11
+    image: mariadb:12.3
     container_name: romm-db
     env_file:
       - ../common/secrets/.runtime/games.env
     environment:
       MARIADB_DATABASE: romm
       MARIADB_USER: romm
+      # Run mariadb-upgrade on start after image major bumps (idempotent).
+      MARIADB_AUTO_UPGRADE: 1
     volumes:
       - /mnt/app/db/romm-db:/var/lib/mysql
     healthcheck:
@@ -59,7 +59,7 @@ services:
   romm:
     <<: *hardened
     cap_add: *lsio_caps
-    image: rommapp/romm:4
+    image: rommapp/romm:5
     container_name: romm
     ports:
       - "8095:8080"
@@ -70,11 +70,152 @@ services:
       DB_PORT: 3306
       DB_NAME: romm
       DB_USER: romm
+      # Public ingress. RomM builds absolute links (login redirects, invites)
+      # from this, so it must match the Traefik router host below.
+      ROMM_BASE_URL: https://games.yourdomain.com
+      # OIDC via plex-oidc-bridge (auth.yourdomain.com) — same shared client as
+      # abooks/ebooks/ebookrequests/music. The bridge's friend filter is what
+      # actually gates access: only Plex users shared on the server server
+      # can get a token. OIDC_CLIENT_SECRET comes from games.env (SOPS).
+      #
+      # OIDC_CLAIM_ROLES is deliberately UNSET. The bridge emits no groups
+      # claim, and RomM rejects every login with 403 if a role claim is
+      # configured but absent. Unset => everyone lands on Role.USER plus the
+      # default permission group ("Viewer (legacy)"): read-only on the library,
+      # own-only writes on saves/states/collections.
+      OIDC_ENABLED: "true"
+      OIDC_PROVIDER: generic
+      OIDC_CLIENT_ID: changeme
+      OIDC_SERVER_APPLICATION_URL: https://auth.yourdomain.com
+      OIDC_REDIRECT_URI: https://games.yourdomain.com/api/oauth/openid
+      OIDC_ALLOW_REGISTRATION: "true"
+      OIDC_USERNAME_ATTRIBUTE: preferred_username
+      OIDC_AUTOLOGIN: "false"
+      # Keyless metadata sources — each is a plain boolean in
+      # backend/config/__init__.py, no API key or account. IGDB + ScreenScraper
+      # (credentials in games.env) left the obscure/homebrew tail unmatched;
+      # hasheous and playmatch match on the md5/sha1/crc RomM already computes,
+      # which is the reliable way to identify a No-Intro/TOSEC dump whose
+      # filename IGDB can't parse. Scan order is pinned in romm/config.yml.
+      HASHEOUS_API_ENABLED: "true"
+      PLAYMATCH_API_ENABLED: "true"
+      TGDB_API_ENABLED: "true"
+      # HLTB is OFF: measured over the 2026-08-15 scan it returned 82 errors and
+      # 0 successes — every call is "503: Can't connect to HowLongToBeat API".
+      # It contributes nothing and costs a failed round-trip on every rom, which
+      # matters when a scan is ~8s/rom serialized. Re-test before re-enabling.
+      HLTB_API_ENABLED: "false"
+      # LaunchBox matches against a metadata DB it downloads to
+      # LAUNCHBOX_BASE_PATH (/romm/launchbox), NOT a live API — so it needs the
+      # scheduled updater below to be of any use, and the path needs the named
+      # volume or it re-downloads on every recreate.
+      LAUNCHBOX_API_ENABLED: "true"
+      ENABLE_SCHEDULED_UPDATE_LAUNCHBOX_METADATA: "true"
+      SCHEDULED_UPDATE_LAUNCHBOX_METADATA_CRON: "0 4 * * 0"
+      # The library is hand-curated and changes rarely, but it now has external
+      # users, so a nightly pass keeps new/removed files and previously
+      # unidentified roms from going stale until someone notices.
+      ENABLE_SCHEDULED_RESCAN: "true"
+      SCHEDULED_RESCAN_CRON: "0 3 * * *"
+      # ⚠️ Scheduled tasks and manual scans do NOT share a timeout. A manual
+      # scan is enqueued with job_timeout=SCAN_TIMEOUT (4h default), but every
+      # PeriodicTask — including the scheduled rescan and the LaunchBox
+      # metadata download — gets TASK_TIMEOUT, which defaults to 300s. The
+      # first nightly rescan died on exactly that:
+      #   JobTimeoutException: Task exceeded maximum timeout value (300 seconds)
+      # The scheduled rescan is only a ScanType.QUICK (identifies roms not
+      # already in the DB), so it's a cheap filesystem walk in steady state —
+      # but any night with a real import needs room, as does the LaunchBox DB
+      # pull. Matched to SCAN_TIMEOUT.
+      #
+      # Both raised to 8h on 2026-08-16: a full `unmatched` pass over 1066 roms
+      # ran ~3.8h and was killed by SCAN_TIMEOUT's 4h default mid-library
+      # (JobTimeoutException at 14400s), having only reached amiga/appleii/
+      # atari2600 alphabetically. The Apple II backlog (~2.4k roms at ~5-8s
+      # each) would hit the same wall under TASK_TIMEOUT. A scan commits each
+      # rom as it goes and QUICK/UNMATCHED both skip completed work, so a
+      # timeout is recoverable — but it is silent, and log idleness looks
+      # identical to success. Give both real headroom.
+      TASK_TIMEOUT: "28800"
+      SCAN_TIMEOUT: "28800"
+      # RomM matches OIDC users by email, so user's existing local admin row
+      # (user@yourdomain.com) is what a Plex login lands on — verified 2026-08-13.
+      #
+      # ⚠️ This flag is FRONTEND-ONLY. It only hides the form in Login.vue;
+      # POST /api/login still authenticates (auth.py::login has no gate on it).
+      # Re-verified 2026-08-15: LAN `POST :8095/api/login` returns a genuine
+      # 401 {"detail":"Incorrect username or password"} from RomM, while the
+      # public host returns a bare Traefik 403 (content-length 9, no
+      # content-type). So password login is closed ONLY on the public host, and
+      # only because of the romm-login-deny router below.
+      #
+      # LAN :8095 remains a working password path — that is deliberate, and it
+      # is the break-glass route if plex-oidc-bridge is ever down.
+      DISABLE_USERPASS_LOGIN: "true"
     volumes:
       - /mnt/data/roms:/romm/library/roms
+      # Firmware/BIOS. ⚠️ The path is structure-dependent:
+      # firmware_handler.py::get_firmware_fs_structure returns
+      # "<platform>/bios" for Structure B but "bios/<platform>" for Structure A
+      # — and has_structure_path_a (isdir(/romm/library/roms)) takes priority,
+      # so we are firmly Structure A. RomM therefore looks in
+      # /romm/library/bios/<platform>/, NOT /romm/library/roms/<platform>/bios/.
+      # Putting a bios dir inside a platform folder would just add a junk
+      # multi-file rom and register no firmware.
+      - /mnt/data/bios:/romm/library/bios
       - /mnt/app/db/romm/assets:/romm/assets
-      # Phase 4: ./romm/ moved from games/romm/.
+      - /mnt/app/db/romm/launchbox:/romm/launchbox
       - ./romm:/romm/config
+      # The image declares VOLUME /romm and VOLUME /redis-data, so any path
+      # under them that we do NOT bind becomes a docker-managed ANONYMOUS
+      # volume. That already cost us once: a stale /romm anon volume orphaned
+      # 3.5G of cover art, invisible until a prune would have eaten it.
+      # resources/ is the scraped artwork cache (~16G, re-scrapeable but slow:
+      # ~5-8s per rom, serialized across the provider chain).
+      - /mnt/app/db/romm/resources:/romm/resources
+      # /redis-data holds valkey's dump.rdb, which persists the rq_scheduler
+      # jobs - INCLUDING the hand-patched 28800s timeout on "Scheduled rescan".
+      # TASK_TIMEOUT binds at first registration only, so losing this file
+      # silently reverts the nightly rescan to dying at 300s.
+      - /mnt/app/db/romm/redis-data:/redis-data
+    # RomM ships no healthcheck of its own, so docker reported health as "none"
+    # and autoheal had nothing to act on. /api/heartbeat is unauthenticated and
+    # is the same endpoint both Zabbix web scenarios probe. start_period covers
+    # the alembic migrations on a version bump.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    labels:
+      - "autoheal=true"
+      - "traefik.enable=true"
+      - "traefik.http.routers.romm.rule=Host(`games.yourdomain.com`)"
+      - "traefik.http.routers.romm.entrypoints=websecure"
+      - "traefik.http.routers.romm.tls.certresolver=myresolver"
+      - "traefik.http.services.romm.loadbalancer.server.port=8080"
+      - "traefik.docker.network=edge_internal"
+      # Deny password login on the PUBLIC host only.
+      #
+      # RomM's DISABLE_USERPASS_LOGIN is frontend-only — it hides the form in
+      # Login.vue but POST /api/login still authenticates (backend/endpoints/
+      # auth.py::login has no gate on it, and protected_route doesn't check it
+      # either). So the env var alone leaves a credential-stuffing endpoint
+      # exposed. This router closes it for real.
+      #
+      # LAN :8095 bypasses Traefik entirely, so password login still works
+      # there — that is the break-glass path if plex-oidc-bridge is ever down.
+      #
+      # ipAllowList with an RFC 5737 TEST-NET-1 range matches no real client,
+      # so every request hitting this router gets Traefik's default 403.
+      - "traefik.http.routers.romm-login-deny.rule=Host(`games.yourdomain.com`) && Path(`/api/login`) && Method(`POST`)"
+      - "traefik.http.routers.romm-login-deny.entrypoints=websecure"
+      - "traefik.http.routers.romm-login-deny.tls.certresolver=myresolver"
+      - "traefik.http.routers.romm-login-deny.priority=100"
+      - "traefik.http.routers.romm-login-deny.service=romm"
+      - "traefik.http.routers.romm-login-deny.middlewares=romm-login-deny@docker"
+      - "traefik.http.middlewares.romm-login-deny.ipallowlist.sourcerange=192.0.2.0/24"
     depends_on:
       romm-db:
         condition: service_healthy
@@ -85,6 +226,50 @@ services:
       - edge_internal
       - nas_default
 
+  romm-discord-notify:
+    <<: *hardened
+    image: alpine:3.24
+    container_name: romm-discord-notify
+    # RomM ships no webhooks or notification agents (checked against
+    # docs.romm.app and the 5.x OpenAPI surface), so this polls
+    # GET /api/roms?order_by=id&order_dir=desc and diffs against a stored
+    # high-water-mark of the last announced rom id. Rom ids are autoincrement,
+    # and created_at is stable across rescans (the April 2026 import still
+    # carries its original timestamps), so the nightly QUICK rescan
+    # re-identifying existing files generates no notifications.
+    #
+    # First run SEEDS the high-water-mark and announces nothing — otherwise
+    # standing this up would post all 7.4k existing games to the channel.
+    #
+    # Auth is a RomM client API token (Administration -> Client API Tokens)
+    # scoped to roms.read ONLY and non-expiring. Verified: /api/roms -> 200,
+    # /api/users -> 403. Revoke on that same screen to kill the feed.
+    command: sh -c "apk add --no-cache curl jq && exec /notify.sh"
+    env_file:
+      # Dedicated file rather than games.env, so this container does not
+      # receive the RomM DB password, IGDB/ScreenScraper credentials or the
+      # OIDC client secret.
+      - ../common/secrets/.runtime/romm-notify.env
+    environment:
+      ROMM_URL: http://romm:8080
+      PUBLIC_URL: https://games.yourdomain.com
+      POLL_INTERVAL: "300"
+      # Above this many new roms in one poll, post a single grouped summary
+      # embed instead of one per game. A scan import can add hundreds at once
+      # (240 on 2026-08-16); 24 back-to-back messages is a flood, not a feed.
+      BULK_THRESHOLD: "15"
+      WEBHOOK_USERNAME: RomM
+    volumes:
+      - ./romm-discord-notify.sh:/notify.sh:ro
+      - /mnt/app/db/romm-discord-notify:/state
+    depends_on:
+      romm:
+        condition: service_healthy
+    # nas_default (bridge) is needed both for the on-boot `apk add` over alpine
+    # repos and for outbound to discord.com. romm is on nas_default too, so no
+    # internal network is required to reach its API.
+    networks:
+      - nas_default
 
 networks:
   nas_default:

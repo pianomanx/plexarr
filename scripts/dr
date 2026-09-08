@@ -1,8 +1,7 @@
 #!/bin/bash
 
 # Define container lists
-GT_CONTAINERS="gluetun prowlarr autobrr lounge"
-QBT_CONTAINERS="gluetun-qbt qbittorrent"
+GT_CONTAINERS="gluetun prowlarr autobrr lounge slskd sabnzbd qbittorrent"
 
 # Function to show usage
 show_usage() {
@@ -10,8 +9,7 @@ show_usage() {
     echo "Restart Docker containers."
     echo
     echo "Options:"
-    echo "  -g              Restart base gluetun containers"
-    echo "  -q              Restart qbittorent containers"
+    echo "  -g              Restart gluetun and dependent containers"
     echo "  -h              Show this help message"
     echo
     echo "You may also specify one or more container names as arguments (after any options) to restart them."
@@ -30,14 +28,10 @@ restart_containers() {
 named_option_used=false
 
 # Parse options
-while getopts ":gqh" opt; do
+while getopts ":gh" opt; do
     case $opt in
         g)
             restart_containers "$GT_CONTAINERS"
-            named_option_used=true
-            ;;
-        q)
-            restart_containers "$QBT_CONTAINERS"
             named_option_used=true
             ;;
         h)

@@ -1,9 +1,5 @@
 # host: server
 # project: serve-books — audiobook + ebook stack
-#
-# Phase 4 trust zone. Services migrated from:
-#   - abook/  — audiobookshelf, abs-tract, readmeabook, plex-scan-watcher
-#   - ebook/  — shelfmark, grimmory, grimmory-mariadb
 
 x-defaults: &defaults
   restart: unless-stopped
@@ -108,29 +104,23 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=edge_internal"
-      - "traefik.http.routers.readmeabook.rule=Host(`abooks.yourdomain.com`) || Host(`abook.yourdomain.com`)"
+      - "traefik.http.routers.readmeabook.rule=Host(`abooks.yourdomain.com`)"
       - "traefik.http.routers.readmeabook.entrypoints=websecure"
       - "traefik.http.routers.readmeabook.tls.certresolver=myresolver"
-      - "traefik.http.routers.readmeabook.middlewares=crowdsec@file,rmab-secure-headers@docker,rmab-ratelimit@docker"
       - "traefik.http.services.readmeabook.loadbalancer.server.port=3030"
-      - "traefik.http.middlewares.rmab-secure-headers.headers.stsSeconds=31536000"
-      - "traefik.http.middlewares.rmab-secure-headers.headers.stsIncludeSubdomains=true"
-      - "traefik.http.middlewares.rmab-secure-headers.headers.stsPreload=true"
-      - "traefik.http.middlewares.rmab-secure-headers.headers.frameDeny=true"
-      - "traefik.http.middlewares.rmab-secure-headers.headers.contentTypeNosniff=true"
-      - "traefik.http.middlewares.rmab-secure-headers.headers.browserXssFilter=true"
-      - "traefik.http.middlewares.rmab-secure-headers.headers.referrerPolicy=strict-origin-when-cross-origin"
-      - "traefik.http.middlewares.rmab-secure-headers.headers.permissionsPolicy=camera=(), microphone=(), geolocation=(), payment=()"
-      - "traefik.http.middlewares.rmab-secure-headers.headers.customResponseHeaders.X-Powered-By="
-      - "traefik.http.middlewares.rmab-secure-headers.headers.customResponseHeaders.Server="
-      - "traefik.http.middlewares.rmab-ratelimit.ratelimit.average=100"
-      - "traefik.http.middlewares.rmab-ratelimit.ratelimit.burst=200"
-      - "traefik.http.middlewares.rmab-ratelimit.ratelimit.period=1m"
+      # abooks.yourdomain.com is the ONLY hostname for this app (PUBLIC_URL above).
+      # The legacy abook.yourdomain.com router (a 301 to the canonical host, kept
+      # for old bookmarks) was removed 2026-08-24 — it was the last thing still
+      # requesting an ACME cert for that name, and traefik kept retrying a stale
+      # orphaned acme.json entry for it on every restart. The DNS CNAME is left
+      # in place; abook.yourdomain.com now falls through to Traefik's default and
+      # 404s rather than redirecting.
       - "autoheal=true"
     networks:
       - edge_internal
       - serve_plex_api
       - arr_egress
+      - arr_control                   # internal: lets automation reach the RMAB API
 
   abs-tract:
     <<: *hardened
@@ -145,7 +135,6 @@ services:
     container_name: plex-scan-watcher
     command: sh -c "apk add --no-cache inotify-tools && /watch.sh"
     volumes:
-      # Phase 4: ./plex-scan-watcher.sh moved from abook/plex-scan-watcher.sh.
       - ./plex-scan-watcher.sh:/watch.sh:ro
       - /mnt/data2/media/audiobooks:/audiobooks:ro
     env_file:
@@ -186,21 +175,7 @@ services:
       - "traefik.http.routers.shelfmark.rule=Host(`ebookrequests.yourdomain.com`)"
       - "traefik.http.routers.shelfmark.entrypoints=websecure"
       - "traefik.http.routers.shelfmark.tls.certresolver=myresolver"
-      - "traefik.http.routers.shelfmark.middlewares=crowdsec@file,shelfmark-secure-headers@docker,shelfmark-ratelimit@docker"
       - "traefik.http.services.shelfmark.loadbalancer.server.port=8084"
-      - "traefik.http.middlewares.shelfmark-secure-headers.headers.stsSeconds=31536000"
-      - "traefik.http.middlewares.shelfmark-secure-headers.headers.stsIncludeSubdomains=true"
-      - "traefik.http.middlewares.shelfmark-secure-headers.headers.stsPreload=true"
-      - "traefik.http.middlewares.shelfmark-secure-headers.headers.frameDeny=true"
-      - "traefik.http.middlewares.shelfmark-secure-headers.headers.contentTypeNosniff=true"
-      - "traefik.http.middlewares.shelfmark-secure-headers.headers.browserXssFilter=true"
-      - "traefik.http.middlewares.shelfmark-secure-headers.headers.referrerPolicy=strict-origin-when-cross-origin"
-      - "traefik.http.middlewares.shelfmark-secure-headers.headers.permissionsPolicy=camera=(), microphone=(), geolocation=(), payment=()"
-      - "traefik.http.middlewares.shelfmark-secure-headers.headers.customResponseHeaders.X-Powered-By="
-      - "traefik.http.middlewares.shelfmark-secure-headers.headers.customResponseHeaders.Server="
-      - "traefik.http.middlewares.shelfmark-ratelimit.ratelimit.average=100"
-      - "traefik.http.middlewares.shelfmark-ratelimit.ratelimit.burst=200"
-      - "traefik.http.middlewares.shelfmark-ratelimit.ratelimit.period=1m"
       - "autoheal=true"
     # arr_egress (bridge) needed for OIDC discovery — shelfmark resolves
     # auth.yourdomain.com via public DNS and round-trips through pfSense +
@@ -210,94 +185,165 @@ services:
       - arr_control
       - arr_egress
 
-  grimmory:
+  bookorbit-discord-notify:
     <<: *hardened
-    cap_add: *lsio_caps
-    image: grimmory/grimmory:v3.2.2
-    container_name: grimmory
+    image: alpine:3.24
+    container_name: bookorbit-discord-notify
+    # Announces books that actually LANDED in BookOrbit to #ebook-releases.
+    #
+    # Deliberately NOT Shelfmark's download_complete: since the 2026-08-22 switch
+    # to BOOKS_OUTPUT_MODE=folder, a completed download has only reached the Book
+    # Dock — it still has to clear auto-finalize before it is a book. Shelfmark
+    # also cannot produce a rich card at all; its NotificationContext holds only
+    # title/author/format/source and Apprise sends plain text, not embeds. That is
+    # why Shelfmark has no Discord route; Telegram keeps its `all` route.
+    #
+    # Covers 401 without a JWT, so they cannot be linked by URL the way RomM's
+    # can. The bytes are uploaded with the webhook as a multipart attachment
+    # (attachment://cover.jpg), which also keeps ebook covers from being publicly
+    # fetchable.
+    command: sh -c "apk add --no-cache curl jq && exec /notify.sh"
+    env_file:
+      # BOOKORBIT_USER / BOOKORBIT_PASS / DISCORD_WEBHOOK. Dedicated SOPS file
+      # rather than bookorbit.env so this container never sees the Postgres
+      # password or the JWT/encryption keys.
+      - ../common/secrets/.runtime/bookorbit-notify.env
+    environment:
+      BOOKORBIT_URL: http://bookorbit:3000
+      PUBLIC_URL: https://ebooks.yourdomain.com
+      POLL_INTERVAL: "300"
+      # Ebooks arrive one or two at a time, so the default is a rich per-book
+      # message with its cover. Above this, one plain summary embed instead —
+      # Discord allows at most 10 attachments per message.
+      BULK_THRESHOLD: "8"
+      WEBHOOK_USERNAME: BookOrbit
+    volumes:
+      - ./bookorbit-discord-notify.sh:/notify.sh:ro
+      - /mnt/app/db/bookorbit-discord-notify:/state
     depends_on:
-      grimmory-mariadb:
+      bookorbit:
+        condition: service_started
+    # arr_egress is a bridge AND bookorbit sits on it, so this one network covers
+    # both reaching the API by name and outbound to alpine repos + discord.com.
+    networks:
+      - arr_egress
+
+  # ---------------------------------------------------------------------------
+  # BookOrbit — PRIMARY ebook app as of 2026-08-22 (promoted from trial).
+  #
+  # NOT a Booklore/Grimmory fork: an independent NestJS + Vue + Postgres
+  # rewrite of the same feature set. Adopted because Grimmory's reader does
+  # not work on Android, and because Book Dock's auto-fetch + auto-finalize
+  # closes the metadata gap that Shelfmark's direct-API delivery left open.
+  #
+  # Grimmory + grimmory-mariadb were decommissioned 2026-08-22 once the switch
+  # settled. /mnt/app/db/grimmory is deliberately RETAINED (data dir, MariaDB
+  # datadir, and decomm/grimmory-2026-08-22-final.sql.gz — a logical dump taken
+  # at teardown), so a rollback or a late progress migration only needs the two
+  # service blocks and the serve_books_grimmory_db network restored from git.
+  # ---------------------------------------------------------------------------
+  bookorbit:
+    <<: *hardened
+    # Upstream's own compose uses exactly this cap set for the su-exec
+    # privilege drop in server/entrypoint.sh.
+    cap_add: *lsio_caps
+    # Tag has no leading "v" — docker/metadata-action strips it.
+    image: ghcr.io/bookorbit/bookorbit:2.6.0
+    container_name: bookorbit
+    init: true
+    depends_on:
+      bookorbit-postgres:
         condition: service_healthy
     expose:
-      - "6060"
+      - "3000"
     env_file:
-      - ../common/secrets/.runtime/ebook.env
+      - ../common/secrets/.runtime/bookorbit.env
     environment:
-      - USER_ID=999
-      - GROUP_ID=999
-      - TZ=Some/Region
-      - DATABASE_URL=jdbc:mariadb://grimmory-mariadb:3306/grimmory
-      - DATABASE_USERNAME=grimmory
-      - DISK_TYPE=LOCAL
+      NODE_ENV: production
+      PORT: "3000"
+      TZ: Some/Region
+      PUID: 999
+      PGID: 999
+      POSTGRES_HOST: bookorbit-postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: bookorbit
+      POSTGRES_DB: bookorbit
+      APP_URL: https://ebooks.yourdomain.com
+      # Keeps the library-creation folder picker off the container root.
+      LIBRARY_BROWSE_ROOT: /books
+      BOOK_DOCK_PATH: /bookdock
+      # NOT set: OIDC_ALLOW_LOCAL_ISSUERS. auth.yourdomain.com resolves to the
+      # WAN address (<WAN address>) and hairpins through pfSense, so the
+      # issuer is a public host from the container's point of view and
+      # BookOrbit's SSRF filter never sees a private address. This is the
+      # same class of flag as Grimmory's OIDC_ALLOW_UNSAFE_HOSTS.
     volumes:
-      - /mnt/app/db/grimmory/data:/app/data
       - /mnt/data2/media/ebooks/library:/books
-      - /mnt/data2/media/ebooks/bookdrop:/bookdrop
-    # Image ships a HEALTHCHECK as of grimmory/grimmory v3.0.x — let it own
-    # the timing + endpoint so upstream tuning flows through automatically.
+      # Shared with shelfmark, which drops completed downloads here in
+      # folder mode. Nothing else watches this dock.
+      - /mnt/data2/media/ebooks/bookdrop:/bookdock
+      - /mnt/app/db/bookorbit/data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "node", "-e", "const p=process.env.PORT||3000;fetch('http://127.0.0.1:'+p+'/api/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=edge_internal"
-      # Main router
-      - "traefik.http.routers.grimmory.rule=Host(`ebooks.yourdomain.com`)"
-      - "traefik.http.routers.grimmory.entrypoints=websecure"
-      - "traefik.http.routers.grimmory.tls.certresolver=myresolver"
-      - "traefik.http.routers.grimmory.middlewares=crowdsec@file,grimmory-secure-headers@docker,grimmory-ratelimit@docker"
-      - "traefik.http.services.grimmory.loadbalancer.server.port=6060"
-      # Stricter email rate-limit router
-      - "traefik.http.routers.grimmory-email.rule=Host(`ebooks.yourdomain.com`) && PathRegexp(`^/api/v[0-9]+/.*(email|send).*`)"
-      - "traefik.http.routers.grimmory-email.entrypoints=websecure"
-      - "traefik.http.routers.grimmory-email.tls.certresolver=myresolver"
-      - "traefik.http.routers.grimmory-email.priority=100"
-      - "traefik.http.routers.grimmory-email.middlewares=crowdsec@file,grimmory-secure-headers@docker,grimmory-email-ratelimit@docker"
-      - "traefik.http.routers.grimmory-email.service=grimmory"
-      # Security headers (incl. CSP for EPUB reader iframe compensation)
-      - "traefik.http.middlewares.grimmory-secure-headers.headers.stsSeconds=31536000"
-      - "traefik.http.middlewares.grimmory-secure-headers.headers.stsIncludeSubdomains=true"
-      - "traefik.http.middlewares.grimmory-secure-headers.headers.stsPreload=true"
-      - "traefik.http.middlewares.grimmory-secure-headers.headers.frameDeny=true"
-      - "traefik.http.middlewares.grimmory-secure-headers.headers.contentTypeNosniff=true"
-      - "traefik.http.middlewares.grimmory-secure-headers.headers.browserXssFilter=true"
-      - "traefik.http.middlewares.grimmory-secure-headers.headers.referrerPolicy=strict-origin-when-cross-origin"
-      - "traefik.http.middlewares.grimmory-secure-headers.headers.permissionsPolicy=camera=(), microphone=(), geolocation=(), payment=()"
-      - "traefik.http.middlewares.grimmory-secure-headers.headers.customResponseHeaders.X-Powered-By="
-      - "traefik.http.middlewares.grimmory-secure-headers.headers.customResponseHeaders.Server="
-      - "traefik.http.middlewares.grimmory-secure-headers.headers.contentSecurityPolicy=default-src 'self'; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline' blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; font-src 'self' data: blob:; connect-src 'self' blob: https://auth.yourdomain.com; frame-src 'self' blob:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'"
-      - "traefik.http.middlewares.grimmory-ratelimit.ratelimit.average=100"
-      - "traefik.http.middlewares.grimmory-ratelimit.ratelimit.burst=200"
-      - "traefik.http.middlewares.grimmory-ratelimit.ratelimit.period=1m"
-      - "traefik.http.middlewares.grimmory-email-ratelimit.ratelimit.average=3"
-      - "traefik.http.middlewares.grimmory-email-ratelimit.ratelimit.burst=6"
-      - "traefik.http.middlewares.grimmory-email-ratelimit.ratelimit.period=1m"
+      - "traefik.http.routers.bookorbit.rule=Host(`ebooks.yourdomain.com`)"
+      - "traefik.http.routers.bookorbit.entrypoints=websecure"
+      - "traefik.http.routers.bookorbit.tls.certresolver=myresolver"
+      - "traefik.http.services.bookorbit.loadbalancer.server.port=3000"
+      # Separate router for the send-to-Kindle email endpoints.
+      - "traefik.http.routers.bookorbit-email.rule=Host(`ebooks.yourdomain.com`) && PathRegexp(`^/api/v[0-9]+/.*(email|send).*`)"
+      - "traefik.http.routers.bookorbit-email.entrypoints=websecure"
+      - "traefik.http.routers.bookorbit-email.tls.certresolver=myresolver"
+      - "traefik.http.routers.bookorbit-email.priority=100"
+      - "traefik.http.routers.bookorbit-email.service=bookorbit"
+      # Code-split chunks: BookOrbit's Vue bundle is hundreds of content-hashed
+      # files, served by their own router so they can be treated separately.
+      - "traefik.http.routers.bookorbit-assets.rule=Host(`ebooks.yourdomain.com`) && PathPrefix(`/assets/`)"
+      - "traefik.http.routers.bookorbit-assets.entrypoints=websecure"
+      - "traefik.http.routers.bookorbit-assets.tls.certresolver=myresolver"
+      - "traefik.http.routers.bookorbit-assets.priority=150"
+      - "traefik.http.routers.bookorbit-assets.service=bookorbit"
       - "autoheal=true"
     networks:
-      - edge_internal
-      - serve_books_grimmory_db
-      - arr_egress  # cover art / metadata fetches
+      - edge_internal                 # traefik + postfix relay for send-to-Kindle
+      - serve_books_bookorbit_db
+      - arr_egress                    # metadata providers
+      - arr_control                   # internal: lets automation reach the BookOrbit API
 
-  grimmory-mariadb:
+  bookorbit-postgres:
     <<: *hardened
     cap_add: *lsio_caps
-    image: lscr.io/linuxserver/mariadb:11.4.12
-    container_name: grimmory-mariadb
+    # pgvector image, not stock postgres: BookOrbit requires the vector,
+    # pg_trgm and uuid-ossp extensions.
+    image: pgvector/pgvector:pg18
+    container_name: bookorbit-postgres
     env_file:
-      - ../common/secrets/.runtime/ebook.env
+      - ../common/secrets/.runtime/bookorbit.env
     environment:
-      - PUID=999
-      - PGID=999
-      - TZ=Some/Region
-      - MYSQL_DATABASE=grimmory
-      - MYSQL_USER=grimmory
+      POSTGRES_USER: bookorbit
+      POSTGRES_DB: bookorbit
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: Some/Region
     volumes:
-      - /mnt/app/db/grimmory/mariadb:/config
+      - /mnt/app/db/bookorbit/postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost"]
-      interval: 5s
+      test: ["CMD-SHELL", 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 20s
     networks:
-      - serve_books_grimmory_db
-
+      - serve_books_bookorbit_db
 
 networks:
   nas_default:
@@ -310,5 +356,5 @@ networks:
     external: true
   serve_plex_api:
     external: true
-  serve_books_grimmory_db:
+  serve_books_bookorbit_db:
     external: true

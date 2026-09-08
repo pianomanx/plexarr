@@ -31,7 +31,7 @@ If you want to compare the older shape, the 12-themed-project layout (`nas` `sys
 Main host `server` (TrueNAS Scale, runs everything user-facing):
 - **[edge/](./edge/docker-compose.yml)** — Public ingress + auth/security perimeter
     - [Traefik](https://github.com/traefik/traefik) — Reverse proxy (the only thing other than Plex exposed to the WAN)
-    - [oauth2-proxy](https://github.com/oauth2-proxy/oauth2-proxy) + [Plex OIDC Bridge](https://github.com/tikibozo/plex-oidc-bridge) — Plex-account-backed SSO for non-plex services
+    - [Plex OIDC Bridge](https://github.com/tikibozo/plex-oidc-bridge) — Plex-account-backed SSO (OIDC) for the non-Plex apps (audiobooks, ebooks, games)
     - [CrowdSec](https://www.crowdsec.net/) + firewall bouncer — log-driven IP banning
     - [Wizarr](https://github.com/Wizarrrr/wizarr) Occasional new user signups
 - **[monitor/](./monitor/docker-compose.yml)** — Observability
@@ -42,6 +42,7 @@ Main host `server` (TrueNAS Scale, runs everything user-facing):
     - [Scrutiny](https://github.com/AnalogJ/scrutiny) SMART disk-health history + wear trending
     - [Beszel](https://github.com/henrygd/beszel) Lightweight per-container CPU/mem/net metrics
     - [prowlarr-indexer-report](https://github.com/tikibozo/prowlarr-indexer-report) Ranks Prowlarr indexers by usefulness
+    - [monitor/activity-monitor/](./monitor/activity-monitor/) — "is anyone reading or playing right now?" for the apps Tautulli can't see, checked before anything disruptive
     - [Postfix](https://github.com/bokysan/docker-postfix) SMTP relay
     - [rclone](https://rclone.org/) backups
 - **[acquire/](./acquire/docker-compose.yml)** — VPN-fronted downloaders + indexers
@@ -61,21 +62,21 @@ Main host `server` (TrueNAS Scale, runs everything user-facing):
     - [Seerr](https://seerr.dev/) + [Requestrr](https://github.com/thomst08/requestrr) User requests
 - **[serve-books/](./serve-books/docker-compose.yml)** — Audiobooks + ebooks
     - [ReadMeABook](https://github.com/kikootwo/readmeabook) + [Audiobookshelf](https://github.com/advplyr/audiobookshelf) + [abs-tract](https://github.com/ahobsonsayers/abs-tract) for Audiobooks
-    - [Shelfmark](https://github.com/calibrain/shelfmark), [Grimmory](https://github.com/grimmory-tools/grimmory) for eBooks
+    - [Shelfmark](https://github.com/calibrain/shelfmark) + [BookOrbit](https://github.com/bookorbit/bookorbit) for eBooks
 - **[serve-games/](./serve-games/docker-compose.yml)** — Retro gaming
     - [RomM](https://github.com/rommapp/romm) for game organization/browsing/playing
 - **[process/](./process/docker-compose.yml)** — Post-processing + analytics
     - [Tdarr](https://home.tdarr.io/) for download post-processing to expected formats
     - [Subarr](https://github.com/coaxk/subarr) + subgen (Whisper transcription worker) to create otherwise-unavailable subtitles
     - [Unpackerr](https://github.com/Unpackerr/unpackerr) for archive management
-    - [Kometa](https://kometa.wiki/) - collections
+    - [Kometa](https://kometa.wiki/) - collections, plus [kometa-ai](https://github.com/tikibozo/kometa-ai) — Claude judges which films belong in the fuzzier thematic collections
     - [Recyclarr](https://github.com/recyclarr/recyclarr) TRaSH guide deployment
     - [Fetcharr](https://github.com/egg82/fetcharr) to keep things fresh
     - [Tautulli](https://tautulli.com/) + [Tracearr](https://github.com/connorgallopo/tracearr) for reporting
     - [plex-watch-sync](https://github.com/tikibozo/plex-watch-sync) mirrors watched/progress state between Plex accounts
-- **[personal/](./personal/docker-compose.yml)** — High-data-sensitivity stacks (private docker networks, no cross-talk by default)
+- **[personal/](./personal/docker-compose.yml)** — Photos & Docs
     - [Immich](https://immich.app/) — Self-hosted photo/video
-    - [Nextcloud](https://nextcloud.com/) + Postgres + Redis + ClamAV + Elasticsearch
+    - [Nextcloud](https://nextcloud.com/) + Postgres + Redis + ClamAV + Elasticsearch - Private doc cloud
 
 Off-site host `cloud-server` (small cloud VM, exists so an outage of `server` still notifies):
 - **[zabbix/](./zabbix/docker-compose.yml)** — Zabbix server stack

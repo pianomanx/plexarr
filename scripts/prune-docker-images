@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Purge unused Docker images. Split out of update-docker-images (2026-07-21)
+# so an image pull no longer immediately deletes the image it replaced —
+# that left no local copy to roll back to if a new image was bad.
+#
+# Renovate merges land Sunday and deploy Monday morning; this runs weekly on
+# Thursday so a superseded image survives locally for ~3 days (long enough to
+# `up -d` back onto it) before it is reaped. Wired as a Thursday cron on
+# server (TrueNAS middleware, user user), cloud-server, and home-server.
+set -uo pipefail
+
+echo "==== Pruning unused Docker images on host: ${HOSTNAME} ($(date '+%Y-%m-%d %H:%M:%S')) ===="
+# -a: remove ALL images not referenced by a container (running or stopped),
+# not just dangling layers — this is what reaps the superseded :tag images
+# that a pull leaves behind. Images backing live/stopped containers are kept.
+docker image prune -a -f
+echo "==== Docker image prune complete on ${HOSTNAME} ===="

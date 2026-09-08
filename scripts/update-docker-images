@@ -1,68 +1,303 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env bash
+# Phase 4 (2026-05-06): rewritten to iterate $PROJECTS from projects.conf
+# instead of hardcoding per-host case statements. Per-project hooks (e.g.,
+# qbittorrent stop ordering, monproxy post-start) live in case statements
+# below, keyed on the new zone names.
+#
+# 2026-07-27: error handling. A Docker Hub rate limit ("toomanyrequests")
+# during the acquire pull aborted that project's pull, and because the
+# qbittorrent stop hook had already run, qui/qbittorrent were left stopped.
+# Four changes came out of that:
+#   1. Transient registry errors (rate limits, TLS/i-o timeouts, mid-layer
+#      EOFs) are retried with backoff instead of failing the project.
+#   2. Stop hooks run AFTER the pull, so a pull that never succeeds can no
+#      longer be the reason a container is stopped.
+#   3. Anything the script stopped is restarted on the way out, including on
+#      interrupt/abort, via an EXIT trap.
+#   4. Every project is verified after `up`: services that were running
+#      before the update and aren't after are restarted, and whatever is
+#      still down is reported in a summary with a non-zero exit so the cron
+#      mail is unmistakably a failure.
+set -uo pipefail
 
-# Get the current hostname
-HOSTNAME="$(hostname)"
+source "$(dirname "$(readlink -f "$0")")/common.sh"
 
-# Print a header
 echo "==== Updating Docker containers on host: ${HOSTNAME} ===="
 
-case "${HOSTNAME}" in
+# ---------------------------------------------------------------------------
+# Failure accounting
+# ---------------------------------------------------------------------------
+# Nothing in the per-project loop is fatal on its own — one broken project must
+# not stop the other nine from updating. Problems are collected here and
+# reported together at the end, where they also set the exit status.
+ISSUES=()
+issue() { ISSUES+=("$1"); echo "  ERROR: $1" >&2; }
 
-  "server")
-    echo Update nas
-    docker compose -f /mnt/app/home/user/compose/nas/docker-compose.yml pull -q
-    docker compose -f /mnt/app/home/user/compose/nas/docker-compose.yml up -d --always-recreate-deps
+# Services this run stopped on purpose (pre-up hooks), as "proj|service".
+# The EXIT trap restarts anything still down.
+STOPPED_BY_HOOK=()
+
+# ---------------------------------------------------------------------------
+# Retry
+# ---------------------------------------------------------------------------
+# Registry failures are overwhelmingly transient: Docker Hub / GHCR rate limits,
+# TLS handshake timeouts, connections reset mid-layer. The daemon's own
+# retry-after hint is useless (it reports microseconds), so back off linearly on
+# our own schedule. Override for a manual run: PULL_ATTEMPTS=1 scripts/update-docker-images
+PULL_ATTEMPTS="${PULL_ATTEMPTS:-4}"
+PULL_BACKOFF="${PULL_BACKOFF:-30}"   # seconds, multiplied by the attempt number
+
+TRANSIENT_RE='toomanyrequests|too many requests|429|rate limit|TLS handshake timeout|i/o timeout|connection reset by peer|unexpected EOF|net/http: request canceled|context deadline exceeded|temporary failure in name resolution|no route to host|503 Service Unavailable|500 Internal Server Error'
+
+# run_with_retry <label> <command...>
+# Output is captured rather than streamed so it can be pattern-matched; every
+# attempt's output is echoed, so the cron mail still shows what happened. Only
+# used for pull/build, which run with -q and are near-silent on success.
+run_with_retry() {
+    local label="$1"; shift
+    local attempt=1 out rc delay
+    while :; do
+        out=$("$@" 2>&1); rc=$?
+        [ -n "$out" ] && printf '%s\n' "$out"
+        [ $rc -eq 0 ] && return 0
+        if [ "$attempt" -ge "$PULL_ATTEMPTS" ] || ! grep -qiE "$TRANSIENT_RE" <<<"$out"; then
+            return "$rc"
+        fi
+        delay=$(( PULL_BACKOFF * attempt ))
+        echo "  $label: transient failure (attempt $attempt/$PULL_ATTEMPTS) — retrying in ${delay}s"
+        sleep "$delay"
+        attempt=$(( attempt + 1 ))
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Service state helpers
+# ---------------------------------------------------------------------------
+# Names of the services currently running in a project, one per line. Used to
+# take a before/after snapshot: only services that were up before the update are
+# expected to be up after it, which keeps one-shot containers (kometa,
+# gallery-dl, recyclarr) from being flagged or spuriously restarted.
+running_services() {
+    docker compose -f "$1" ps --services --status running 2>/dev/null | sed '/^$/d' | sort
+}
+
+svc_running() {
+    [ -n "$(docker compose -f "$1" ps -q --status running "$2" 2>/dev/null)" ]
+}
+
+# Bring a single service up without touching its dependencies. `up` is preferred
+# over `start` because a service whose container was removed (a failed recreate)
+# has nothing to start; `start` is the fallback for the reverse case.
+start_service() {
+    local compose_file="$1" svc="$2"
+    docker compose -f "$compose_file" up -d --no-deps "$svc" >/dev/null 2>&1 ||
+        docker compose -f "$compose_file" start "$svc" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Safety net: never exit with something we stopped still stopped
+# ---------------------------------------------------------------------------
+# Covers the paths the per-project verification can't: an interrupt, a `set -u`
+# abort, or a hook that stopped a service before the run died. Idempotent — on a
+# clean run every service is already back up and this is just a state check.
+recover_hook_stops() {
+    local entry proj svc compose_file
+    [ ${#STOPPED_BY_HOOK[@]} -eq 0 ] && return 0
+    for entry in "${STOPPED_BY_HOOK[@]}"; do
+        proj="${entry%%|*}"; svc="${entry##*|}"
+        compose_file="$BASE/$proj/docker-compose.yml"
+        svc_running "$compose_file" "$svc" && continue
+        echo "  RECOVER: $proj/$svc was stopped by this run and is still down — starting it" >&2
+        start_service "$compose_file" "$svc" ||
+            echo "  ERROR: failed to restart $proj/$svc — needs a human" >&2
+    done
+}
+trap recover_hook_stops EXIT
+trap 'echo "==== interrupted — restoring stopped services" >&2; exit 130' INT TERM
+
+# Docker Hub's anonymous pull quota is what bit this script on 2026-07-27. An
+# authenticated daemon gets a much higher limit, so a missing login is worth a
+# nudge (never fatal — GHCR/LSCR pulls work fine unauthenticated).
+if ! grep -q 'index\.docker\.io' "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null; then
+    echo "WARN: no docker.io credentials in ${DOCKER_CONFIG:-$HOME/.docker}/config.json —" \
+         "pulls use the anonymous rate limit. Run 'docker login' as this user." >&2
+fi
+
+# Phase 2a (Model B): pick up merged Renovate / human PRs before pulling
+# images. Compose files on disk drive `compose pull` and the subsequent
+# `up -d --always-recreate-deps`, so they need to be the fresh `main`
+# revision. Bail on conflict (anything dirty needs a human to resolve
+# before deploys proceed).
+pre_head=""; post_head=""
+if [ -d "$BASE/.git" ]; then
+    echo "==== git pull --ff-only in ${BASE}"
+    pre_head=$(git -C "$BASE" rev-parse HEAD 2>/dev/null || true)
+    if ! git -C "$BASE" pull --ff-only; then
+        echo "ERROR: git pull --ff-only failed (dirty tree or non-ff). Aborting deploy." >&2
+        exit 1
+    fi
+    post_head=$(git -C "$BASE" rev-parse HEAD 2>/dev/null || true)
     echo ""
+fi
 
-    echo Update media
-    docker compose -f /mnt/app/home/user/compose/media/docker-compose.yml pull -q
-    docker compose -f /mnt/app/home/user/compose/media/docker-compose.yml up -d --always-recreate-deps
+# True if this pull brought in changes under <proj>/. Locally-built images (image: *:local, e.g.
+# monitor's activity-monitor) have no registry to pull from, so a merged Renovate/human change to
+# their Dockerfile (base bump) or baked scripts only lands if we rebuild — this lets
+# the cron do that automatically instead of a human remembering to. No-op for pull-only projects.
+proj_changed() {
+    [ -n "$pre_head" ] && [ -n "$post_head" ] && [ "$pre_head" != "$post_head" ] || return 1
+    ! git -C "$BASE" diff --quiet "$pre_head" "$post_head" -- "$1/"
+}
+
+# Phase 4: ensure external networks exist before any compose operation.
+# TrueNAS may have wiped them since last boot.
+ensure_external_networks
+
+# Phase 1d: materialize SOPS secrets to .runtime/ before compose pull/up.
+# Without this, `compose pull` succeeds but `up` fails on missing env_file.
+decrypt_secrets || exit $?
+if [ "$HOSTNAME" = "server" ]; then
+    decrypt_yaml_to traefik-middlewares.sops.yaml \
+        "$BASE/common/secrets/.runtime/traefik-middlewares.yml" || exit $?
+    decrypt_yaml_to kometa-config.sops.yaml \
+        "$BASE/common/secrets/.runtime/kometa-config.yml" || exit $?
+    decrypt_yaml_to crowdsec-bouncer.sops.yaml \
+        "$BASE/common/secrets/.runtime/crowdsec-firewall-bouncer.yaml" || exit $?
+    decrypt_file_to rclone-monitor.sops.yaml \
+        "$BASE/common/secrets/.runtime/rclone-monitor.conf" || exit $?
+fi
+if [ "$HOSTNAME" = "cloud-server" ]; then
+    decrypt_file_to rclone-zabbix.sops.yaml \
+        "$BASE/common/secrets/.runtime/rclone-zabbix.conf" || exit $?
+fi
+
+# Stop services in $proj, recording them so they are guaranteed to be started
+# again — by the post-up verification on the happy path, by the EXIT trap
+# otherwise. Services that were already down stay down (they're deliberate).
+hook_stop() {
+    local proj="$1"; shift
+    local compose_file="$BASE/$proj/docker-compose.yml" svc
+    local to_stop=()
+    for svc in "$@"; do
+        svc_running "$compose_file" "$svc" && to_stop+=("$svc")
+    done
+    [ ${#to_stop[@]} -eq 0 ] && return 0
+    echo "  Stopping ${to_stop[*]} in order before recreate..."
+    docker compose -f "$compose_file" stop "${to_stop[@]}" || true
+    for svc in "${to_stop[@]}"; do STOPPED_BY_HOOK+=("$proj|$svc"); done
+}
+
+# Per-project pre-up hooks. Deliberately run AFTER `compose pull` (see the
+# 2026-07-27 header note): a pull can take minutes and can fail outright, and
+# nothing here needs to be stopped for the pull itself.
+pre_up_hook() {
+    local proj="$1"
+    case "$proj" in
+        acquire)
+            # qBittorrent shares gluetun's net namespace (qui connects to it
+            # over the host port). Recreating gluetun mid-flight kills
+            # qBittorrent's connectivity, can leave a stale lockfile, and
+            # flaps autoheal. Stop both first so gluetun recreates cleanly.
+            hook_stop "$proj" qui qbittorrent
+            ;;
+    esac
+}
+
+# Per-host post-loop extras (legacy operations not tied to a single project).
+host_post_loop() {
+    case "$HOSTNAME" in
+        server)
+            # subcleaner is a Bazarr plugin tracked outside the main compose
+            # tree (vendor checkout updated independently). Refresh on each
+            # cron run so plugin scripts stay current.
+            if [ -d /mnt/app/db/bazarr/subcleaner ]; then
+                echo "==== Update bazarr subcleaner"
+                ( cd /mnt/app/db/bazarr/subcleaner && sudo -u plex git pull ) ||
+                    issue "bazarr subcleaner: git pull failed"
+                echo ""
+            fi
+            ;;
+    esac
+}
+
+# Compare the before/after snapshots and repair the difference. A service that
+# was running before the update and isn't now is a regression regardless of
+# which step failed, so this is the single place that catches all of them.
+verify_project() {
+    local proj="$1" compose_file="$2" before="$3"
+    local after missing svc still_down=()
+
+    after=$(running_services "$compose_file")
+    missing=$(comm -23 <(printf '%s\n' "$before" | sed '/^$/d') \
+                       <(printf '%s\n' "$after"  | sed '/^$/d'))
+    [ -z "$missing" ] && return 0
+
+    for svc in $missing; do
+        echo "  RECOVER: $proj/$svc was running before the update and is now down — starting it"
+        start_service "$compose_file" "$svc" || true
+        svc_running "$compose_file" "$svc" || still_down+=("$svc")
+    done
+
+    [ ${#still_down[@]} -eq 0 ] && return 0
+    issue "$proj: still down after recovery: ${still_down[*]}"
+}
+
+for proj in $PROJECTS; do
+    compose_file="$BASE/$proj/docker-compose.yml"
+    if [ ! -f "$compose_file" ]; then
+        issue "$compose_file does not exist (projects.conf out of sync?)"
+        continue
+    fi
+
+    echo "==== Update $proj"
+    before_running=$(running_services "$compose_file")
+
+    # --ignore-buildable: skip images built from source (image: *:local) — no registry to pull them
+    # from. (Without this the pull errored "pull access denied" for every buildable image.)
+    # A pull that fails after all retries is NOT fatal for the project: `up` below still runs and
+    # brings services back on the images already on disk. Better a stale container than a down one.
+    if ! run_with_retry "$proj pull" \
+            docker compose -f "$compose_file" pull -q --ignore-buildable; then
+        issue "$proj: image pull failed after $PULL_ATTEMPTS attempts — continuing with on-disk images"
+    fi
+
+    # Rebuild local images when this pull changed their sources (a merged Renovate base-image bump
+    # or a code change) so the merge deploys without a manual rebuild. --pull freshens the base layer,
+    # which means this hits the registry too and gets the same retry treatment.
+    if proj_changed "$proj"; then
+        echo "  $proj sources changed in this pull — rebuilding local image(s)"
+        run_with_retry "$proj build" \
+            docker compose -f "$compose_file" build --pull -q ||
+            issue "$proj: local image build failed — running on the previously built image"
+    fi
+
+    pre_up_hook "$proj"
+
+    if ! docker compose -f "$compose_file" up -d --always-recreate-deps; then
+        # One service with a missing/broken image fails the whole `up`, taking
+        # its siblings down with it. Retry each existing service on its own so
+        # the blast radius is the one service that is actually broken.
+        issue "$proj: 'up -d' failed — retrying service-by-service"
+        for svc in $(docker compose -f "$compose_file" ps --services --all 2>/dev/null); do
+            docker compose -f "$compose_file" up -d --no-deps "$svc" >/dev/null 2>&1 || true
+        done
+    fi
+
+    verify_project "$proj" "$compose_file" "$before_running"
     echo ""
+done
 
-    echo Update sys
-    docker compose -f /mnt/app/home/user/compose/sys/docker-compose.yml pull -q
-    docker compose -f /mnt/app/home/user/compose/sys/docker-compose.yml up -d --always-recreate-deps
-    echo ""
+host_post_loop
 
-    echo Update abook
-    docker compose -f /mnt/app/home/user/compose/abook/docker-compose.yml pull -q
-    docker compose -f /mnt/app/home/user/compose/abook/docker-compose.yml up -d --always-recreate-deps
-    echo ""
-
-    echo Update rpt
-    docker compose -f /mnt/app/home/user/compose/rpt/docker-compose.yml pull -q
-    docker compose -f /mnt/app/home/user/compose/rpt/docker-compose.yml up -d --always-recreate-deps
-    echo ""
-
-    echo Update monproxy
-    docker compose -f /mnt/app/home/user/compose/monproxy/docker-compose.yml pull -q
-    docker compose -f /mnt/app/home/user/compose/monproxy/docker-compose.yml up -d --always-recreate-deps
-    echo ""
-
-    echo Update photo
-    docker compose -f /mnt/app/home/user/compose/photo/docker-compose.yml pull -q
-    docker compose -f /mnt/app/home/user/compose/photo/docker-compose.yml up -d --always-recreate-deps
-    echo ""
-
-    docker image prune -a -f
-    echo ""
-    ;;
-
-  "monitoringserver")
-    echo Update mon
-    docker compose -f /home/user/compose/mon/docker-compose.yml pull -q
-    docker compose -f /home/user/compose/mon/docker-compose.yml up -d --always-recreate-deps
-    echo ""
-
-    docker image prune -a -f
-    echo ""
-    ;;
-
-  *)
-    echo "ERROR: Unknown hostname: ${HOSTNAME}"
-    echo "Please update the script with a valid case for this hostname."
+# NOTE: image pruning is deliberately NOT done here. Deleting the superseded
+# image immediately after a pull leaves nothing to roll back to. Pruning is a
+# separate weekly (Thursday) cron running scripts/prune-docker-images, which
+# keeps replaced images around for ~3 days. See that script for rationale.
+echo ""
+if [ ${#ISSUES[@]} -gt 0 ]; then
+    echo "==== Docker update FINISHED WITH ${#ISSUES[@]} ERROR(S) on ${HOSTNAME} ===="
+    printf '  - %s\n' "${ISSUES[@]}"
+    echo "==== Re-run scripts/update-docker-images once the cause is cleared ===="
     exit 1
-    ;;
-esac
-
+fi
 echo "==== Docker containers updated successfully on ${HOSTNAME} ===="

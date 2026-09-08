@@ -1,10 +1,5 @@
 # host: server
 # project: monitor — observability + ops infrastructure
-#
-# Phase 4 trust zone. Services migrated from:
-#   - sys/      — postfix, rclone, uptime-kuma, autoheal
-#   - monproxy/ — zabbix-proxy, mysql-server (renamed monitor-mysql), zabbix-agent2
-#   - media/    — organizr, homepage, socket-proxy-homepage
 
 x-defaults: &defaults
   restart: unless-stopped
@@ -54,7 +49,6 @@ services:
       POSTFIX_local_header_rewrite_clients: "static:all"
     volumes:
       - /mnt/app/db/postfix/queue:/var/spool/postfix
-      # Phase 4: ./postfix/ moved from sys/postfix/ as part of monitor/ migration.
       - ./postfix/sender_canonical_maps:/etc/postfix/sender_canonical_maps:ro
     networks:
       - mon_egress
@@ -68,7 +62,7 @@ services:
     # Phase 5: ran as `rcd` (remote control daemon) only — no in-container
     # FUSE mounts, so SYS_ADMIN + SETPCAP dropped. /dev/fuse still bound
     # in case a future RC API call invokes a mount; no FUSE caps granted.
-    image: rclone/rclone:1.74.3
+    image: rclone/rclone:1.75.0
     container_name: rclone
     cap_add:
       # cap_drop:ALL stripped root's DAC bypass, so the backup failed on
@@ -142,7 +136,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     # autoheal talks to docker daemon via socket only — no network membership needed.
 
-  # Zabbix proxy (forwards server metrics to server's zabbix-server).
+  # Zabbix proxy (forwards server metrics to cloud-server's zabbix-server).
   # Note: NNP intentionally NOT set on this service. Adding it caused ICMP
   # host-availability monitoring (server, ruckusAP1, c1000) to fail.
   # fping has cap_net_raw=ep file caps which NNP appears to break. The
@@ -189,18 +183,14 @@ services:
     volumes:
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
-      # Phase 4: ./proxy-config/ moved from monproxy/proxy-config/.
       - ./proxy-config/zabbix_proxy_db_tls.conf:/etc/zabbix/zabbix_proxy_db_tls.conf:ro
 
-  # Phase 4: renamed from `mysql-server` for clarity within the new
-  # multi-DB monitor zone.
   monitor-mysql:
     <<: *hardened
-    # Pinned to 8.0 — 8.4 removed the `--skip-character-set-client-handshake`
-    # and `--default-authentication-plugin` options in the command block below,
-    # and disables the `mysql_native_password` auth plugin by default. A real
-    # 8.4 upgrade needs config + auth-plugin migration first; see PR #23 fallout.
-    image: mysql:8.0
+    # 8.4 LTS since 2026-07-20: accounts migrated to caching_sha2_password
+    # (proxy connects with DBTLSConnect=required, so full sha2 auth is fine);
+    # the removed-in-8.4 options were dropped from the command block.
+    image: mysql:8.4
     container_name: monitor-mysql
     # SYS_NICE for io_uring scheduling priority; LSIO 5-cap for the
     # gosu-style drop to the mysql user + initdb chown.
@@ -220,13 +210,10 @@ services:
       - mysqld
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_bin
-      - --skip-character-set-client-handshake
-      - --default-authentication-plugin=mysql_native_password
       - --disable-log-bin
     volumes:
       - /mnt/app/db/zabbixproxy/var/lib/mysql:/var/lib/mysql:rw
     env_file:
-      # Phase 4: ./env_vars/ moved from monproxy/env_vars/.
       - ./env_vars/.env_db_mysql
     secrets:
       - MYSQL_USER
@@ -241,8 +228,7 @@ services:
     <<: *hardened
     # NNP-off must be retained — agent uses /usr/bin/fping (setuid bit)
     # for ICMP host-availability monitors. NNP breaks the setuid jump
-    # and ICMP items stop reporting. See feedback memory
-    # `zabbix_proxy_nnp_breaks_icmp`.
+    # and ICMP items stop reporting.
     security_opt: []
     # Phase 5: replaced `privileged: true` with an explicit cap set.
     # - SYS_PTRACE: agent discovers processes via /proc/*/status
@@ -388,7 +374,7 @@ services:
   # the UI is reachable over LAN/OpenVPN but not WAN.
   dozzle:
     <<: *hardened
-    image: amir20/dozzle:v10.6.6
+    image: amir20/dozzle:v10.9.0
     container_name: dozzle
     environment:
       - DOZZLE_NO_ANALYTICS=true
@@ -453,7 +439,8 @@ services:
 
   # Scrutiny - SMART attribute history + trend dashboard. Omnibus image
   # bundles collector + web + InfluxDB 2.x. ADDITIVE only: Multi-Report and
-  # Zabbix remain the alerting path; Scrutiny is for visual wear trending.
+  # Zabbix remain the alerting path; Scrutiny is for visual wear trending
+  # (boot SA400 ~30% life, app-pool sdf ~90% TBW are worth watching).
   #
   # Device access: drives are behind the SAS HBA/expander where /dev/sdX
   # names reorder across reboots, so an explicit `devices:` list would go
@@ -461,23 +448,32 @@ services:
   # classes instead (major 8 = sd*, 259 = nvme) + bind /dev so smartctl
   # always sees the live set. Phase 5 posture kept: NO `privileged: true`.
   #
-  # Least-priv caps: SYS_RAWIO (ATA/SCSI SMART passthrough) + SYS_ADMIN
-  # (NVMe smart-log ioctl). If it fails to start under cap_drop ALL, check
-  # `docker logs scrutiny` and restore caps per the zabbix-agent2 method.
-  # Collector runs once daily. Internal only - reachable at server:8089 via
-  # the mon_egress bridge.
+  # Least-priv caps: SYS_RAWIO only (ATA/SCSI SMART passthrough). SYS_ADMIN
+  # is deliberately omitted - it is only needed for the NVMe smart-log
+  # ioctl, so the 2 NVMe special/cache vdevs (young, healthy) will be
+  # absent from Scrutiny while every SATA/SAS drive incl. the wear ones
+  # works. Add SYS_ADMIN back only if NVMe coverage is wanted. If it fails
+  # to start under cap_drop ALL, check `docker logs scrutiny` and restore
+  # caps per the zabbix-agent2 method. Collector runs once daily.
+  #
+  # Internal only - no traefik/edge. Reachable at server:8089 via the
+  # mon_egress bridge (mon_internal is internal:true so it cannot publish
+  # a host port; nothing intra-project needs to reach Scrutiny).
   scrutiny:
     <<: *hardened
     cap_add:
       - SYS_RAWIO
-      # SYS_ADMIN: NVMe smart-log ioctl needs it; SATA/SAS only need SYS_RAWIO.
+      # SYS_ADMIN: NVMe smart-log ioctl needs it (the 2 NVMe special/cache
+      # vdevs); SATA/SAS only need SYS_RAWIO.
       - SYS_ADMIN
       # The omnibus image ships /opt/scrutiny/web (and assets/) as mode
       # 0644 DIRECTORIES - no search/execute bit - and relies on the
       # container running as root with full DAC bypass to traverse them.
       # `<<: *hardened` cap_drop ALL removes that, so the web server can
       # readdir but cannot open index.html/*.js -> browser gets a raw file
-      # listing. DAC_READ_SEARCH restores read+traverse only (read-only).
+      # listing. DAC_READ_SEARCH restores read+traverse only (read-only;
+      # NOT DAC_OVERRIDE - config/influxdb are root-owned proper-mode bind
+      # mounts that already work).
       - DAC_READ_SEARCH
     image: ghcr.io/analogj/scrutiny:v0.9.2-omnibus
     container_name: scrutiny
@@ -485,10 +481,12 @@ services:
       - COLLECTOR_CRON_SCHEDULE=0 0 * * *
       - TZ=Some/Region
     device_cgroup_rules:
-      # SCSI-disk majors: 8 = sda-sdp; sdq+ rolls to 65, then 66-71 and
-      # 128-135. Drives span the SAS expander across several majors, so
-      # grant the full SCSI-disk major set (still least-priv: specific
-      # block majors, not `privileged`). 259 = nvme/blkext.
+      # SCSI-disk majors: 8 = sda-sdp only; sdq+ rolls to 65, then 66-71
+      # and 128-135. Drives span the SAS expander across several majors,
+      # so grant the full SCSI-disk major set (still least-priv: specific
+      # block majors, not `privileged`). 259 = nvme/blkext kept for
+      # forward-compat, but NVMe SMART also needs SYS_ADMIN (intentionally
+      # omitted) so the NVMe controllers stay absent by design.
       - "b 8:* rwm"
       - "b 65:* rwm"
       - "b 66:* rwm"
@@ -507,10 +505,11 @@ services:
       - "b 135:* rwm"
       - "b 259:* rwm"
       # NVMe SMART uses the controller CHARACTER device /dev/nvmeN
-      # (smartctl --device nvme). char major 245 = nvme, 244 = nvme-generic.
-      # CAVEAT: these are *dynamically* allocated majors - if NVMe drives
-      # drop out of Scrutiny after a kernel upgrade, re-check
-      # `grep nvme /proc/devices` and update these numbers.
+      # (smartctl --device nvme), not the nvme0n1 block node. char major
+      # 245 = nvme, 244 = nvme-generic. CAVEAT: these are *dynamically*
+      # allocated majors (unlike the static SCSI block majors above) - if
+      # NVMe drives drop out of Scrutiny after a kernel/TrueNAS upgrade,
+      # re-check `grep nvme /proc/devices` and update these numbers.
       - "c 244:* rwm"
       - "c 245:* rwm"
     volumes:
@@ -524,12 +523,18 @@ services:
       - mon_egress
 
   # Beszel - lightweight server-monitoring hub (PocketBase web app + SQLite).
-  # Live per-container CPU/mem/net view, complementing Zabbix (alerting),
-  # Scrutiny (SMART), Dozzle (logs), Uptime-Kuma (uptime).
+  # Evaluated mainly for its live per-container CPU/mem/net view, complementing
+  # Zabbix (alerting), Scrutiny (SMART), Dozzle (logs), Uptime-Kuma (uptime).
   #
   # The hub connects OUT to beszel-agent over mon_internal (beszel-agent:45876),
   # authenticating with the hub's own ed25519 public key. Internal only - bound
   # to the DMZ NIC (10.0.0.3:8092) like dozzle/scrutiny/uptime-kuma; no WAN.
+  # 8092 chosen to avoid 8090 (dozzle), 8089 (scrutiny), 3001/3011/9393.
+  #
+  # Hardening: PocketBase binds 8090 (non-privileged) and owns /beszel_data as
+  # root via the bind mount, so cap_drop ALL with no caps should suffice. If
+  # first-run logs show permission errors on /beszel_data, restore CHOWN/
+  # DAC_OVERRIDE per the zabbix-agent2 triage method.
   beszel:
     <<: *hardened
     image: henrygd/beszel:0
@@ -548,12 +553,20 @@ services:
 
   # Beszel agent - collects host + per-container stats for the hub. Runs in
   # SSH-listen mode: it listens on 45876 (mon_internal) and the hub dials in,
-  # authenticating against KEY (the hub's ed25519 PUBLIC key). A public key is
-  # not a secret - it's authorized_keys material - so it's inlined rather than
-  # SOPS-encrypted. No host port published; only the hub reaches it.
+  # authenticating against KEY (the hub's ed25519 PUBLIC key, derived from
+  # /mnt/app/db/beszel/beszel_data/id_ed25519). A public key is not a secret -
+  # it's authorized_keys material - so it's inlined rather than SOPS-encrypted.
+  # No host port published; only the hub (same mon_internal) reaches it.
   #
   # Reads Docker via the dedicated read-only socket-proxy (DOCKER_HOST), not a
-  # raw socket mount - matches the homepage/dozzle posture.
+  # raw socket mount - matches the homepage/dozzle posture. Container CPU/mem/net
+  # stats come from the docker API; host CPU/mem from the container's host-wide
+  # /proc. Host root-disk + temperature panels need a host-fs/`/sys` mount +
+  # FILESYSTEM - out of scope for this trial (the goal is container stats).
+  #
+  # Hardening: reads /proc and writes its root-owned data dir as root, listens
+  # on a non-privileged port, talks to the proxy over TCP - cap_drop ALL, no
+  # caps. If logs show permission errors, triage per the zabbix-agent2 method.
   beszel-agent:
     <<: *hardened
     image: henrygd/beszel-agent:0
@@ -567,22 +580,27 @@ services:
       # Read the docker API via the dedicated read-only proxy (no socket mount).
       - DOCKER_HOST=tcp://socket-proxy-beszel:2375
       # Headline the CPU package temp in the All-Systems table (default is the
-      # hottest sensor, which on a many-drive NAS is always a drivetemp). All
-      # sensors stay available in the system detail view - this only sets the
-      # summary sensor.
+      # hottest sensor, which on this 23-drive NAS is always a drivetemp). All
+      # 41 sensors stay available in the system detail view - this only sets the
+      # summary sensor. Key string is Beszel's exact sensor id (verified against
+      # the hub's recorded system_stats; per-drive temps also live in Scrutiny).
       - PRIMARY_SENSOR=coretemp_package_id_0
     volumes:
       - /mnt/app/db/beszel/agent_data:/var/lib/beszel-agent
       # No /extra-filesystems disk panels: TrueNAS owns disk usage + I/O. ZFS
-      # nested datasets defeat Beszel's single-statfs-per-mount model and
-      # per-pool I/O has no /proc/diskstats device, so the pool panels were
-      # misleading. Temps work without any /sys mount (the container reads host hwmon).
+      # nested datasets defeat Beszel's single-statfs-per-mount model (a pool
+      # root only refers a sliver of the pool's bytes) and per-pool I/O has no
+      # /proc/diskstats device, so the pool panels were misleading. The default
+      # root-disk gauge (docker overlay on the app pool) is left as-is.
+      # Temps work without any /sys mount (the container reads host hwmon).
     networks:
       - mon_internal
 
   # Dedicated read-only docker API proxy for the Beszel agent. Scoped to the
   # minimum Beszel polls: CONTAINERS (list + /containers/{id}/stats) + INFO,
-  # plus PING/VERSION.
+  # plus PING/VERSION. EVENTS left off - Beszel polls the container list on an
+  # interval, so it discovers new containers without the events stream; flip
+  # EVENTS=1 if newly-started containers are slow to appear.
   socket-proxy-beszel:
     <<: *hardened
     image: lscr.io/linuxserver/socket-proxy:3.4.0
@@ -623,7 +641,7 @@ services:
   # an unprivileged port, writes nothing, reads no host files.
   prowlarr-indexer-report:
     <<: *hardened
-    image: ghcr.io/user/prowlarr-indexer-report:0.5.2
+    image: ghcr.io/user/prowlarr-indexer-report:0.6.1
     container_name: prowlarr-indexer-report
     env_file:
       # PROWLARR_API_KEY — decrypted from prowlarr-indexer-report.sops.yaml.
@@ -647,6 +665,48 @@ services:
     networks:
       - mon_egress
 
+  # "Is anyone using the system right now?" for the two stacks that do NOT go
+  # through Plex/Tautulli: BookOrbit (ebooks) and RomM (retro games). Exists
+  # for the PRE-CHANGE GATE — check this before a reboot, a router upgrade, or
+  # anything else disruptive, the same way Tautulli get_activity is checked for
+  # Plex.
+  #
+  # Read-only by construction: a SELECT-only postgres role (svc_activity) and a
+  # RomM client token scoped to roms.user.read ONLY — verified 403 on /api/roms.
+  activity-monitor:
+    <<: *hardened
+    build: ./activity-monitor
+    image: activity-monitor:local
+    container_name: activity-monitor
+    env_file:
+      # BOOKORBIT_DB_PASSWORD + ROMM_TOKEN, from activity-monitor.sops.yaml.
+      - ../common/secrets/.runtime/activity-monitor.env
+    environment:
+      # RomM over its published host port rather than by container name, so
+      # this service does not need to join nas_default (same approach as
+      # prowlarr-indexer-report reaching Prowlarr).
+      - ROMM_URL=http://server.mylocal:8095
+      - BOOKORBIT_DB_HOST=bookorbit-postgres
+      # A page turn is the only thing that moves reading_progress.updated_at,
+      # so this must tolerate a slow reader sitting on one page. RomM is not
+      # subject to it — its own 90s Redis TTL already defines "active".
+      - READER_WINDOW_MIN=15
+      - REFRESH_SECONDS=30
+    ports:
+      - 9698:8788
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8788/healthz', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    # serve_books_bookorbit_db is internal:true — bookorbit-postgres publishes
+    # no host port, so joining it is the only way to reach the DB. mon_egress
+    # (bridge) is what restores port publishing and gives outbound to RomM:
+    # a container on internal-only networks silently loses published ports.
+    networks:
+      - mon_egress
+      - serve_books_bookorbit_db
 
 secrets:
   MYSQL_USER:
@@ -658,16 +718,19 @@ secrets:
   MYSQL_ROOT_PASSWORD:
     file: ./env_vars/.MYSQL_ROOT_PASSWORD
 
-
 networks:
-  # Phase 4 external networks (created by ensure_external_networks).
-  # Phase 6a (2026-05-11): mon_internal flipped from bridge to internal:true.
-  # nas_default dropped — monitor zone is the first to retire the safety net.
+  # External networks created by ensure_external_networks. mon_internal
+  # is internal:true (no egress); mon_egress and edge_internal carry
+  # outbound and ingress traffic respectively.
   mon_internal:
     external: true
   mon_egress:
     external: true
   edge_internal:
+    external: true
+  # Owned by the serve-books project (internal:true). activity-monitor joins it
+  # read-only to reach bookorbit-postgres, which publishes no host port.
+  serve_books_bookorbit_db:
     external: true
 
   # zabbix is a project-internal network with custom IPAM. The 172.220.0.0/16

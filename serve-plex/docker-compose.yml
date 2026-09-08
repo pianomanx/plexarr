@@ -1,9 +1,6 @@
 # host: server
 # project: serve-plex — Plex media server + Plex-adjacent request UIs
 #
-# Phase 4 trust zone. Services migrated from:
-#   - nas/  — plex, seerr, requestrr
-#
 # Plex stays on host network for 32400 (DNS rebinding requires direct TLS,
 # can't proxy via Traefik). seerr and requestrr go through Traefik.
 
@@ -41,7 +38,7 @@ services:
       - DAC_OVERRIDE
       - SETUID
       - SETGID
-    image: plexinc/pms-docker:1.43.1.10611-1e34174b1
+    image: plexinc/pms-docker:1.43.3.10896-cb3ebc72d
     container_name: plex
     environment:
       - PLEX_UID=999
@@ -95,22 +92,6 @@ services:
       - "traefik.http.routers.seerr.rule=Host(`requests.yourdomain.com`) || Host(`overseerr.yourdomain.com`)"
       - "traefik.http.routers.seerr.entrypoints=websecure"
       - "traefik.http.routers.seerr.tls.certresolver=myresolver"
-      - "traefik.http.routers.seerr.middlewares=crowdsec@file,seerr-secure-headers@docker,seerr-ratelimit@docker"
-      # Security headers
-      - "traefik.http.middlewares.seerr-secure-headers.headers.stsSeconds=31536000"
-      - "traefik.http.middlewares.seerr-secure-headers.headers.stsIncludeSubdomains=true"
-      - "traefik.http.middlewares.seerr-secure-headers.headers.stsPreload=true"
-      - "traefik.http.middlewares.seerr-secure-headers.headers.frameDeny=true"
-      - "traefik.http.middlewares.seerr-secure-headers.headers.contentTypeNosniff=true"
-      - "traefik.http.middlewares.seerr-secure-headers.headers.browserXssFilter=true"
-      - "traefik.http.middlewares.seerr-secure-headers.headers.referrerPolicy=strict-origin-when-cross-origin"
-      - "traefik.http.middlewares.seerr-secure-headers.headers.permissionsPolicy=camera=(), microphone=(), geolocation=(), payment=()"
-      - "traefik.http.middlewares.seerr-secure-headers.headers.customResponseHeaders.X-Powered-By="
-      - "traefik.http.middlewares.seerr-secure-headers.headers.customResponseHeaders.Server="
-      # Rate limiting
-      - "traefik.http.middlewares.seerr-ratelimit.ratelimit.average=150"
-      - "traefik.http.middlewares.seerr-ratelimit.ratelimit.burst=300"
-      - "traefik.http.middlewares.seerr-ratelimit.ratelimit.period=1m"
     networks:
       - edge_internal
       - arr_control
@@ -130,7 +111,6 @@ services:
       - arr_control
       - serve_plex_api
       - arr_egress
-
 
 networks:
   nas_default:

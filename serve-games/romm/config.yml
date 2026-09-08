@@ -1,0 +1,74 @@
+# RomM user config.
+#
+# ⚠️ Schema matters and RomM fails SILENTLY on a wrong one. Keys are read with
+# pydash paths in `backend/config/config_manager.py::_parse_config` — the only
+# recognised top-level keys are `exclude`, `system`, `filesystem`, `scan`,
+# `emulatorjs` and `streaming`. Until 2026-08-15 this file used `exclusions:`
+# and `system_mapping:`, which RomM ignored outright: `ports` was scanned, the
+# platform bindings never applied, and ~1.4k roms sat unmatched behind bogus
+# `megadrive`/`neogeo`/`sega32x` platform rows. Verify any change actually took
+# effect via `/api/heartbeat` → `FILESYSTEM.FS_PLATFORMS`, which lists the
+# folders RomM will scan AFTER exclusions.
+
+exclude:
+  platforms:
+    # Two Amiga launcher scripts, no roms. Kept on disk for the Amiberry users.
+    - ports
+  roms:
+    single_file:
+      # Extensions are matched WITHOUT a leading dot (cf. the built-in
+      # DEFAULT_EXCLUDED_EXTENSIONS: db, ini, tmp, bak, …). The old ".txt"
+      # form here never matched anything.
+      extensions:
+        - txt
+        - nfo
+        - doc
+        - sh
+        # No-Intro/TOSEC datfiles shipped alongside a set (e.g.
+        # sega32x/"Sega 32X.dat"). They scan as roms and can't ever match.
+        - dat
+      names: []
+    multi_file:
+      names:
+        # A directory inside a platform folder is indexed as ONE multi-file rom,
+        # so every non-game subfolder becomes a single junk entry that swallows
+        # its whole tree. Known ones:
+        #   appleii/Extras     — 284 scans, manuals, GIFs
+        #   sega32x/media      — images/ + manual/, 64 files
+        #   atari2600,n64 /duplicates — 14 and 225 duplicate roms
+        - Extras
+        - media
+        - duplicates
+      parts:
+        extensions: []
+        names: []
+
+system:
+  # Folder name -> RomM platform slug. ONLY slugs present in
+  # `backend/handler/metadata/base_handler.py` carry an IGDB id; anything else
+  # creates an unmatchable platform with no metadata and no artwork. `neogeo`
+  # and `sega32x` are not slugs — `neogeoaes` (IGDB 80) and `sega32` (IGDB 30)
+  # are. `genesis` (IGDB 29) IS a valid slug, so the folder needs no binding;
+  # the old `genesis: megadrive` line was backwards and bound a good folder to
+  # a dead slug.
+  platforms:
+    neogeo: neogeoaes
+    sega32x: sega32
+  versions: {}
+
+scan:
+  priority:
+    # `playmatch` is a valid source but is NOT in RomM's built-in default list,
+    # so it only runs if named here explicitly. igdb stays first — it already
+    # identifies ~82% of the library and re-ordering would churn good matches.
+    # hasheous/playmatch are hash-exact (md5/sha1/crc, present on 8168 of 8181
+    # roms) and sit right behind the two name-matchers as the fallback that
+    # actually resolves the obscure/homebrew tail.
+    metadata:
+      - igdb
+      - ss
+      - hasheous
+      - playmatch
+      - launchbox
+      - tgdb
+      - gamelist
