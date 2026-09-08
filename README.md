@@ -1,5 +1,7 @@
 # plexarr
-One bozo's example of how to automate your entertainment.
+One bozo's example of how to automate your entertainment. If you find this useful click Star and maybe drop some change in the tip jar!
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/K0F026LF64)
 
 So this is a sanitized version of what I'm running. My hope is someone getting started finds this and it helps them in some way. Linux filesystems, permissions, docker compose, networking, etc. knowledge is assumed. I did all this with a lot of searching around the internet to cobble everything together — so it's all out there.
 
